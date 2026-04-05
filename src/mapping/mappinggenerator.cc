@@ -2,6 +2,7 @@ class MappingGenerator{
 public:
     bool completeAddressing;
     bool monoMapping;
+    bool multiResolution;
 
     virtual MappingGenerator* clone() const = 0;
     virtual std::vector<std::vector<int>> getMapping(const std::string label) = 0;

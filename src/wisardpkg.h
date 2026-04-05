@@ -40,6 +40,10 @@ namespace nl = nlohmann;
 #include "binarization/thresholding.cc"
 #include "binarization/meanthresholding.cc"
 #include "binarization/thermometer.cc"
+#include "binarization/distributivethermometer.cc"
+#include "binarization/gaussianthermometer.cc"
+#include "binarization/exponentialthermometer.cc"
+#include "binarization/supervisedthermometer.cc"
 
 //models
 #include "models/base/model.cc"
@@ -64,6 +68,9 @@ namespace nl = nlohmann;
 
 //clusregressionwisard model
 #include "models/clusregressionwisard/clusregressionwisard.cc"
+
+//stochastic thermometer (needs Wisard for optimize)
+#include "binarization/stochasticthermometer.cc"
 
 //wrappers
 #include <pybind11/pybind11.h>

@@ -52,6 +52,9 @@ public:
 
     value = c["completeAddressing"];
     mappingGenerator->completeAddressing = value.is_null() ? true : value.get<bool>();
+
+    softBleaching = false;
+    crossClassScoring = false;
   }
 
   Wisard(unsigned int addressSize, nl::json c={}) : Wisard(c){
@@ -114,6 +117,34 @@ public:
     if(verbose) std::cout << "\r" << std::endl;
   }
 
+  void reset() {
+    for (auto& d : discriminators) {
+      d.second.reset();
+    }
+  }
+
+  void trainSingle(const BinInput& input, const std::string& label) {
+    if (discriminators.find(label) == discriminators.end()) {
+      makeDiscriminator(label, input.size());
+    }
+    discriminators[label].train(input);
+  }
+
+  void untrainSingle(const BinInput& input, const std::string& label) {
+    auto d = discriminators.find(label);
+    if (d != discriminators.end()) {
+      d->second.untrain(input);
+    }
+  }
+
+  nl::json getMappingJson() const {
+    nl::json config;
+    config["mapping"] = nl::json(mappingGenerator->getMappings());
+    config["monoMapping"] = mappingGenerator->monoMapping;
+    config["completeAddressing"] = mappingGenerator->completeAddressing;
+    return config;
+  }
+
   std::map<std::string,std::vector<int>> getMentalImages(){
     std::map<std::string,std::vector<int>> images;
     for(std::map<std::string, Discriminator>::iterator d=discriminators.begin(); d!=discriminators.end(); ++d){
@@ -161,6 +192,80 @@ public:
     for(auto& i: discriminators){
       allvotes[i.first] = i.second.classify(image,totalTrainned);
     }
+
+    // Multi-resolution: reweight votes by RAM address size before Bleaching.
+    if(mappingGenerator->multiResolution){
+      for(auto& entry: allvotes){
+        auto it = discriminators.find(entry.first);
+        if(it != discriminators.end()){
+          std::vector<int> sizes = it->second.getTupleSizes();
+          for(size_t j = 0; j < entry.second.size() && j < sizes.size(); j++){
+            entry.second[j] *= sizes[j];
+          }
+        }
+      }
+    }
+
+    // Cross-class scoring: normalize each RAM's vote by the total across all classes.
+    // Votes unique to one class get amplified; votes shared across classes get dampened.
+    if(crossClassScoring){
+      size_t n_rams = 0;
+      for(auto& entry: allvotes){ n_rams = std::max(n_rams, entry.second.size()); }
+      int n_classes = (int)allvotes.size();
+
+      for(size_t j = 0; j < n_rams; j++){
+        int total = 0;
+        for(auto& entry: allvotes){
+          if(j < entry.second.size()) total += entry.second[j];
+        }
+        if(total > 0){
+          for(auto& entry: allvotes){
+            if(j < entry.second.size()){
+              entry.second[j] = entry.second[j] * n_classes / (total + 1);
+            }
+          }
+        }
+      }
+    }
+
+    // Soft Bleaching: votes contribute their magnitude (vote - threshold) instead of binary 1.
+    if(softBleaching){
+      std::map<std::string, int> labels;
+      int bleaching = 0;
+      bool looping = true;
+
+      while(looping){
+        int min = 0;
+        bool firstTime = true;
+
+        for(auto& entry: allvotes){
+          labels[entry.first] = 0;
+          for(size_t j = 0; j < entry.second.size(); j++){
+            if(entry.second[j] > bleaching){
+              labels[entry.first] += (entry.second[j] - bleaching);
+              if(firstTime || entry.second[j] < min){
+                min = entry.second[j];
+                firstTime = false;
+              }
+            }
+          }
+        }
+
+        bleaching = min;
+
+        // Ambiguity check (same logic as standard Bleaching)
+        int biggest = 0;
+        bool ambiguity = false;
+        for(auto& l: labels){
+          if(l.second > biggest){ biggest = l.second; ambiguity = false; }
+          else if((biggest - l.second) < 1){ ambiguity = true; }
+        }
+
+        looping = ambiguity && biggest > 1;
+      }
+      return labels;
+    }
+
     return classificationMethod->run(allvotes);
   }
 
@@ -211,4 +316,6 @@ protected:
   bool ignoreZero;
   int base;
   bool balanced;
+  bool softBleaching;
+  bool crossClassScoring;
 };

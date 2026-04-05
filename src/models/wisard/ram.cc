@@ -52,6 +52,10 @@ public:
       }
   }
 
+  void reset() {
+    positions.clear();
+  }
+
   std::vector<std::vector<int>> getMentalImage() {
     std::vector<std::vector<int>> mentalPiece(addresses.size());
     for(unsigned int i=0; i<mentalPiece.size(); i++){

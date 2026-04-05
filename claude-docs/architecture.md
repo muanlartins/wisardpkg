@@ -1,0 +1,155 @@
+# Architecture
+
+## Overview
+
+wisardpkg is a C++ Python extension (via PyBind11) implementing the WiSARD (Wilkie, Stonham and Aleksander's Recognition Device) weightless neural network and its variants. The library supports classification, regression, clustering, and data synthesis — all built on the core concept of RAM (Random Access Memory) nodes that learn binary patterns.
+
+**Version:** 2.0.0a7
+**License:** MIT
+**Source language:** C++ with Python bindings
+**Build system:** setuptools + pybind11
+
+## Core Concept: Weightless Neural Networks
+
+Unlike traditional neural networks that learn continuous weights, WiSARD uses RAM lookup tables. Each RAM node:
+1. Receives a subset of the binary input bits (determined by a mapping)
+2. Computes an address from those bits (base-N weighted sum)
+3. Looks up (or stores) a value at that address
+
+This makes training a single write operation and inference a single read — extremely fast.
+
+## Class Hierarchy
+
+```
+Model (abstract)
+├── ClassificationModel
+│   ├── Wisard → WisardWrapper (Python-exposed)
+│   └── ClusWisard → ClusWisardWrapper (Python-exposed)
+└── RegressionModel
+    ├── RegressionWisard → RegressionWisardWrapper (Python-exposed)
+    └── ClusRegressionWisard → ClusRegressionWisardWrapper (Python-exposed)
+
+Discriminator → DiscriminatorWrapper (Python-exposed, standalone use)
+
+ClassificationBase (strategy pattern)
+├── Bleaching
+├── BestBleaching
+├── BBleaching
+└── Weighted
+
+MappingGenerator (abstract)
+└── RandomMapping
+
+BinBase (abstract binarization)
+├── Thresholding
+├── MeanThresholding
+├── SimpleThermometer
+├── DynamicThermometer
+├── DistributiveThermometer      (fit-based, per-feature percentile thresholds)
+├── GaussianThermometer          (fit-based, per-feature Gaussian CDF thresholds)
+├── ExponentialThermometer       (fit-based, per-feature Exponential CDF thresholds)
+├── StochasticThermometer        (fit+optimize, coordinate descent on thresholds)
+└── KernelCanvas → KernelCanvasWrapper (Python-exposed)
+
+Mean (abstract regression aggregation)
+├── SimpleMean
+├── PowerMean
+├── Median
+├── HarmonicMean
+├── HarmonicPowerMean
+├── GeometricMean
+├── ExponentialMean
+└── LogisticMean
+```
+
+## Data Flow
+
+```
+vector<double> (continuous input)
+    │
+    ▼ [Binarization: Thresholding / Thermometer / KernelCanvas / MeanThresholding]
+    │
+BinInput (compact binary vector, 8 bits per byte)
+    │
+    ▼ [Organize into labeled/unlabeled collections]
+    │
+DataSet (collection with optional labels or y-values)
+    │
+    ▼ [Model.train()]
+    │
+WiSARD Model (internal RAM structure: address → vote/value)
+    │
+    ▼ [Model.classify() / Model.predict()]
+    │
+string (classification label) OR double (regression value)
+```
+
+## Module Organization
+
+All source is in `src/` as `.cc` files included from the master header `wisardpkg.h`:
+
+| Directory | Purpose |
+|-----------|---------|
+| `src/common/` | Type definitions (`definetypes.cc`), utilities (`utils.cc`), exceptions (`exceptions.cc`) |
+| `src/binarization/` | Binary encoding techniques (`binbase.cc`, `thresholding.cc`, `meanthresholding.cc`, `thermometer.cc`, `distributivethermometer.cc`, `gaussianthermometer.cc`, `exponentialthermometer.cc`, `stochasticthermometer.cc`, `kernelcanvas.cc`) |
+| `src/classification_methods/` | Vote aggregation strategies (`bleaching.cc`, `bestbleaching.cc`, `bbleaching.cc`, `weighted.cc`, `register.cc`) |
+| `src/mapping/` | Input-to-RAM bit assignment (`mappinggenerator.cc`, `randommapping.cc`, `mappinggeneratorhelper.cc`) |
+| `src/data/` | Data containers (`bininput.cc`, `dataset.cc`) |
+| `src/synthetic_data/` | Data generation (`synthesizers.cc`) |
+| `src/models/base/` | Abstract model interfaces (`model.cc`, `classificationmodel.cc`, `regressionmodel.cc`) |
+| `src/models/wisard/` | Core WiSARD (`ram.cc`, `discriminator.cc`, `wisard.cc`, `ramdatahandle.cc`) |
+| `src/models/cluswisard/` | Clustering WiSARD (`cluster.cc`, `cluswisard.cc`) |
+| `src/models/regressionwisard/` | Regression variant (`regressionram.cc`, `regressionwisard.cc`, `meanfunctions.cc`, `regressionramdatahandle.cc`) |
+| `src/models/clusregressionwisard/` | Clustering regression (`clusregressionwisard.cc`) |
+| `src/wrappers/` | PyBind11 wrappers that handle `py::kwargs` → C++ member assignment |
+
+## Key Design Patterns
+
+### Header-Only Compilation
+All `.cc` files are `#include`'d into `wisardpkg.h`, which is the single compilation unit. The `generate_include.py` script can produce a standalone `include/wisardpkg.hpp` for C++-only usage.
+
+### Wrapper Pattern
+Each Python-exposed model has a `*Wrapper` class that:
+1. Inherits from the C++ implementation class
+2. Accepts `py::kwargs` in its constructor
+3. Iterates kwargs, type-casts values, and assigns to parent members
+4. Clones polymorphic objects (ClassificationBase*, MappingGenerator*, Mean*) to manage ownership
+
+### Strategy Pattern
+- **Classification methods**: Pluggable via `ClassificationBase*` — swap Bleaching for BestBleaching without changing the model
+- **Mean functions**: Pluggable via `Mean*` — swap SimpleMean for PowerMean in regression models
+- **Mapping generators**: Pluggable via `MappingGenerator*` — currently only RandomMapping implemented
+
+### Factory/Registry
+`ClassificationMethods::load()` and `MappingGeneratorHelper::load()` deserialize from JSON by dispatching on a `className` field.
+
+## Core Type Definitions
+
+```cpp
+addr_t               = unsigned long long    // RAM addresses
+index_size_t         = unsigned long long    // Index sizes
+bin_t                = char                  // Binary values (stored in BinInput)
+content_t            = int                   // RAM content for classification (vote counts)
+ram_t                = unordered_map<addr_t, content_t>    // Classification RAM
+regression_content_t = vector<double>        // RAM content for regression [count, sum_y, fit]
+regression_ram_t     = unordered_map<addr_t, regression_content_t>  // Regression RAM
+```
+
+## File Suffixes (Persistence)
+
+| Suffix | Purpose |
+|--------|---------|
+| `.wdpkg` | RAM data files |
+| `.json` | Model configuration |
+| `.wpkds` | Dataset files |
+
+## Serialization
+
+Models serialize to JSON via `json()` methods. RAMDataHandle and RegressionRAMDataHandle use Base64-encoded binary blocks for efficient RAM storage. DataSet has its own text-based format with prefixes: `R` (regression), `C` (classification), `U` (unsupervised).
+
+## Key Source Files
+
+- **Entry point**: `src/wisard_bind.cc` — defines the `PYBIND11_MODULE(wisardpkg, m)` with all class bindings
+- **Master header**: `src/wisardpkg.h` — includes everything in dependency order
+- **Version**: `src/version.h` — single `__version__` constant
+- **JSON library**: `src/libs/json.hpp` — nlohmann/json (vendored)

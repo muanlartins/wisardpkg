@@ -97,6 +97,57 @@ PYBIND11_MODULE(wisardpkg, m){
       .def("getSize", &DynamicThermometer::getSize)
     ;
 
+    py::class_<DistributiveThermometer, BinBase>(m, "DistributiveThermometer", py::module_local())
+      .def(py::init<const size_t>(), py::arg("thermometerSize") = 32)
+      .def("fit", &DistributiveThermometer::fit)
+      .def("getSize", &DistributiveThermometer::getSize)
+      .def("getThresholds", &DistributiveThermometer::getThresholds)
+      .def("setThresholds", &DistributiveThermometer::setThresholds)
+    ;
+
+    py::class_<GaussianThermometer, BinBase>(m, "GaussianThermometer", py::module_local())
+      .def(py::init<const size_t>(), py::arg("thermometerSize") = 32)
+      .def("fit", &GaussianThermometer::fit)
+      .def("getSize", &GaussianThermometer::getSize)
+      .def("getThresholds", &GaussianThermometer::getThresholds)
+      .def("setThresholds", &GaussianThermometer::setThresholds)
+    ;
+
+    py::class_<ExponentialThermometer, BinBase>(m, "ExponentialThermometer", py::module_local())
+      .def(py::init<const size_t>(), py::arg("thermometerSize") = 32)
+      .def("fit", &ExponentialThermometer::fit)
+      .def("getSize", &ExponentialThermometer::getSize)
+      .def("getThresholds", &ExponentialThermometer::getThresholds)
+      .def("setThresholds", &ExponentialThermometer::setThresholds)
+    ;
+
+    py::class_<SupervisedThermometer, BinBase>(m, "SupervisedThermometer", py::module_local())
+      .def(py::init<const size_t, const std::string&, const size_t>(),
+           py::arg("thermometerSize") = 32,
+           py::arg("method") = "class_conditional",
+           py::arg("minBitsPerFeature") = 2)
+      .def("fit", &SupervisedThermometer::fit)
+      .def("getSize", &SupervisedThermometer::getSize)
+      .def("getSizes", &SupervisedThermometer::getSizes)
+      .def("getThresholds", &SupervisedThermometer::getThresholds)
+      .def("setThresholds", &SupervisedThermometer::setThresholds)
+    ;
+
+    py::class_<StochasticThermometer, BinBase>(m, "StochasticThermometer", py::module_local())
+      .def(py::init<const size_t>(), py::arg("thermometerSize") = 32)
+      .def("fit", &StochasticThermometer::fit)
+      .def("optimize", &StochasticThermometer::optimize,
+           py::arg("data"), py::arg("labels"), py::arg("addressSize"),
+           py::arg("validationSize") = 0.2, py::arg("rounds") = 5,
+           py::arg("stepsPerThreshold") = 100,
+           py::arg("numThreads") = 0,
+           py::arg("maxShiftRatio") = 0.5,
+           py::arg("earlyStopWindow") = 0)
+      .def("getSize", &StochasticThermometer::getSize)
+      .def("getThresholds", &StochasticThermometer::getThresholds)
+      .def("setThresholds", &StochasticThermometer::setThresholds)
+    ;
+
     // mapping generators
     py::class_<MappingGenerator>(m, "MappingGenerator", py::module_local())
       .def("getMapping", (std::vector<std::vector<int>> (MappingGenerator::*)(const std::string)) &MappingGenerator::getMapping)

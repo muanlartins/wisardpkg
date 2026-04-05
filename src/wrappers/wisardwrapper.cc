@@ -43,6 +43,15 @@ public:
 
       if(std::string(py::str(arg.first)).compare("monoMapping") == 0)
         mappingGenerator->monoMapping = arg.second.cast<bool>();
+
+      if(std::string(py::str(arg.first)).compare("multiResolution") == 0)
+        mappingGenerator->multiResolution = arg.second.cast<bool>();
+
+      if(std::string(py::str(arg.first)).compare("softBleaching") == 0)
+        softBleaching = arg.second.cast<bool>();
+
+      if(std::string(py::str(arg.first)).compare("crossClassScoring") == 0)
+        crossClassScoring = arg.second.cast<bool>();
     }
   }
 };

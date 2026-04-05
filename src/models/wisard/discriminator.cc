@@ -83,6 +83,13 @@ public:
       }
   }
 
+  void reset() {
+    count = 0;
+    for (unsigned int i = 0; i < rams.size(); i++) {
+      rams[i].reset();
+    }
+  }
+
   int getNumberOfTrainings() const{
     return count;
   }

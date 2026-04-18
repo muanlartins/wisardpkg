@@ -267,6 +267,22 @@ PYBIND11_MODULE(wisardpkg, m){
       .def("rank", (std::map<std::string, int> (WisardWrapper::*)(const BinInput&) const) &WisardWrapper::rank)
       .def("rank", (std::vector<std::map<std::string, int>> (WisardWrapper::*)(const DataSet&) const) &WisardWrapper::rank)
       .def("getTupleSizes", &WisardWrapper::getTupleSizes)
+      .def("trainSingle", &WisardWrapper::trainSingle)
+      .def("untrainSingle", &WisardWrapper::untrainSingle)
+      .def("reset", &WisardWrapper::reset)
+      .def("computeRAMWeights", &WisardWrapper::computeRAMWeights,
+           py::arg("dataset"), py::arg("metric") = "entropy")
+      .def("getRAMWeights", &WisardWrapper::getRAMWeights)
+      .def("setRAMWeights", &WisardWrapper::setRAMWeights)
+      .def("pruneRAMs", &WisardWrapper::pruneRAMs)
+    ;
+
+    py::class_<BloomWisardWrapper, ClassificationModel>(m, "BloomWisard", py::module_local())
+      .def(py::init<int, int, int, py::kwargs>(),
+           py::arg("addressSize"), py::arg("numBits") = 1024, py::arg("numHashes") = 3)
+      .def("reset", &BloomWisardWrapper::reset)
+      .def("rank", (std::map<std::string, int> (BloomWisardWrapper::*)(const BinInput&) const) &BloomWisardWrapper::rank)
+      .def("rank", (std::vector<std::map<std::string, int>> (BloomWisardWrapper::*)(const DataSet&) const) &BloomWisardWrapper::rank)
     ;
 
     py::class_<ClusWisardWrapper, ClassificationModel>(m, "ClusWisard", py::module_local())

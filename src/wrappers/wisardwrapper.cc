@@ -52,6 +52,27 @@ public:
 
       if(std::string(py::str(arg.first)).compare("crossClassScoring") == 0)
         crossClassScoring = arg.second.cast<bool>();
+
+      // Negative evidence
+      if(std::string(py::str(arg.first)).compare("negativeEvidence") == 0)
+        negativeEvidence = arg.second.cast<bool>();
+
+      if(std::string(py::str(arg.first)).compare("negativeAlpha") == 0)
+        negativeAlpha = arg.second.cast<double>();
+
+      if(std::string(py::str(arg.first)).compare("negativeMode") == 0)
+        negativeMode = arg.second.cast<std::string>();
+
+      // Shared discriminator
+      if(std::string(py::str(arg.first)).compare("sharedDiscriminator") == 0)
+        useSharedDiscriminator = arg.second.cast<bool>();
+
+      if(std::string(py::str(arg.first)).compare("sharedBeta") == 0)
+        sharedBeta = arg.second.cast<double>();
+
+      // Attention-like weighting
+      if(std::string(py::str(arg.first)).compare("attentionWeighting") == 0)
+        attentionWeighting = arg.second.cast<bool>();
     }
   }
 };

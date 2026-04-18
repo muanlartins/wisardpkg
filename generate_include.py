@@ -33,6 +33,10 @@ includes = [
     'binarization/thresholding.cc',
     'binarization/meanthresholding.cc',
     'binarization/thermometer.cc',
+    'binarization/distributivethermometer.cc',
+    'binarization/gaussianthermometer.cc',
+    'binarization/exponentialthermometer.cc',
+    'binarization/stochasticthermometer.cc',
 
     'models/base/model.cc',
     'models/base/classificationmodel.cc',

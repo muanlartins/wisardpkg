@@ -5,6 +5,8 @@ typedef char bin_t;
 // Classification
 typedef int content_t;
 typedef std::unordered_map<addr_t, content_t> ram_t;
+typedef std::string large_addr_t;
+typedef std::unordered_map<large_addr_t, content_t> large_ram_t;
 
 // Regression
 typedef std::vector<double> regression_content_t;

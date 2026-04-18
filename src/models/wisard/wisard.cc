@@ -55,6 +55,14 @@ public:
 
     softBleaching = false;
     crossClassScoring = false;
+    negativeEvidence = false;
+    negativeAlpha = 0.0;
+    negativeMode = "uniform";
+    useRAMWeights = false;
+    useSharedDiscriminator = false;
+    sharedBeta = 0.0;
+    sharedDiscriminatorInitialized = false;
+    attentionWeighting = false;
   }
 
   Wisard(unsigned int addressSize, nl::json c={}) : Wisard(c){
@@ -87,6 +95,14 @@ public:
         makeDiscriminator(dataset.getLabel(i), dataset[i].size());
       }
       discriminators[dataset.getLabel(i)].train(dataset[i]);
+
+      if(useSharedDiscriminator){
+        if(!sharedDiscriminatorInitialized){
+          sharedDiscrim = Discriminator(mappingGenerator->getMapping("__shared__"), dataset[i].size(), ignoreZero, base);
+          sharedDiscriminatorInitialized = true;
+        }
+        sharedDiscrim.train(dataset[i]);
+      }
     }
   }
 
@@ -128,6 +144,14 @@ public:
       makeDiscriminator(label, input.size());
     }
     discriminators[label].train(input);
+
+    if(useSharedDiscriminator){
+      if(!sharedDiscriminatorInitialized){
+        sharedDiscrim = Discriminator(mappingGenerator->getMapping("__shared__"), input.size(), ignoreZero, base);
+        sharedDiscriminatorInitialized = true;
+      }
+      sharedDiscrim.train(input);
+    }
   }
 
   void untrainSingle(const BinInput& input, const std::string& label) {
@@ -188,7 +212,7 @@ public:
         totalTrainned += i.second.getNumberOfTrainings();
       }
     }
-    
+
     for(auto& i: discriminators){
       allvotes[i.first] = i.second.classify(image,totalTrainned);
     }
@@ -206,8 +230,38 @@ public:
       }
     }
 
+    // Weighted RAM voting: multiply each RAM's vote by its learned weight.
+    if(useRAMWeights){
+      for(auto& entry: allvotes){
+        auto wit = ramWeights.find(entry.first);
+        if(wit != ramWeights.end()){
+          for(size_t j = 0; j < entry.second.size() && j < wit->second.size(); j++){
+            entry.second[j] = (int)(entry.second[j] * wit->second[j]);
+          }
+        }
+      }
+    }
+
+    // Attention-like weighting: weight each RAM by agreement with consensus.
+    if(attentionWeighting){
+      for(auto& entry: allvotes){
+        std::vector<int>& votes = entry.second;
+        double mean = 0.0;
+        double maxVal = 0.0;
+        for(size_t j = 0; j < votes.size(); j++){
+          mean += votes[j];
+          if(votes[j] > maxVal) maxVal = votes[j];
+        }
+        if(votes.size() > 0) mean /= votes.size();
+
+        for(size_t j = 0; j < votes.size(); j++){
+          double w = 1.0 - std::abs((double)votes[j] - mean) / (maxVal + 1e-9);
+          votes[j] = (int)(votes[j] * w);
+        }
+      }
+    }
+
     // Cross-class scoring: normalize each RAM's vote by the total across all classes.
-    // Votes unique to one class get amplified; votes shared across classes get dampened.
     if(crossClassScoring){
       size_t n_rams = 0;
       for(auto& entry: allvotes){ n_rams = std::max(n_rams, entry.second.size()); }
@@ -228,9 +282,10 @@ public:
       }
     }
 
-    // Soft Bleaching: votes contribute their magnitude (vote - threshold) instead of binary 1.
+    // Compute per-class totals via softBleaching or classification method.
+    std::map<std::string, int> labels;
+
     if(softBleaching){
-      std::map<std::string, int> labels;
       int bleaching = 0;
       bool looping = true;
 
@@ -253,7 +308,6 @@ public:
 
         bleaching = min;
 
-        // Ambiguity check (same logic as standard Bleaching)
         int biggest = 0;
         bool ambiguity = false;
         for(auto& l: labels){
@@ -263,10 +317,51 @@ public:
 
         looping = ambiguity && biggest > 1;
       }
-      return labels;
+    }
+    else{
+      labels = classificationMethod->run(allvotes);
     }
 
-    return classificationMethod->run(allvotes);
+    // Shared discriminator: subtract background response from all class scores.
+    if(useSharedDiscriminator && sharedDiscriminatorInitialized){
+      std::vector<int> sharedVotes = sharedDiscrim.classify(image);
+      int sharedResponse = 0;
+      for(size_t j = 0; j < sharedVotes.size(); j++){
+        if(sharedVotes[j] > 0) sharedResponse++;
+      }
+      for(auto& l: labels){
+        l.second = (int)(l.second - sharedBeta * sharedResponse);
+      }
+    }
+
+    // Negative evidence: penalize each class based on other classes' responses.
+    if(negativeEvidence){
+      int totalAll = 0;
+      for(auto& l: labels) totalAll += l.second;
+
+      std::map<std::string, int> adjusted;
+      for(auto& l: labels){
+        int selfScore = l.second;
+        int othersSum = totalAll - selfScore;
+
+        if(negativeMode == "uniform"){
+          adjusted[l.first] = (int)(selfScore - negativeAlpha * othersSum);
+        }
+        else if(negativeMode == "max_competitor"){
+          int maxComp = 0;
+          for(auto& o: labels){
+            if(o.first != l.first && o.second > maxComp) maxComp = o.second;
+          }
+          adjusted[l.first] = (int)(selfScore - negativeAlpha * maxComp);
+        }
+        else{ // normalized
+          adjusted[l.first] = (int)(selfScore * 1000.0 / (1.0 + negativeAlpha * othersSum));
+        }
+      }
+      labels = adjusted;
+    }
+
+    return labels;
   }
 
   std::vector<std::map<std::string, int>> rank(const DataSet& images) const{
@@ -276,6 +371,124 @@ public:
         out[i] = rank(images[i]);
     }
     return out;
+  }
+
+  // Compute per-RAM quality weights from training data.
+  // Metrics: "entropy", "information_gain", "purity"
+  void computeRAMWeights(const DataSet& dataset, const std::string& metric = "entropy"){
+    // For each discriminator, track per-RAM activation counts per class.
+    // activations[discrim_label][ram_idx][sample_class] = count of times RAM fired
+    std::map<std::string, std::vector<std::map<std::string, int>>> activations;
+    std::map<std::string, std::vector<int>> totalActivations; // total fires per RAM per discrim
+
+    for(auto& d: discriminators){
+      int nRAMs = d.second.getNumberOfRAMS();
+      activations[d.first].resize(nRAMs);
+      totalActivations[d.first].resize(nRAMs, 0);
+    }
+
+    // Pass each training sample through all discriminators.
+    for(size_t i = 0; i < dataset.size(); i++){
+      const std::string& sampleClass = dataset.getLabel(i);
+      for(auto& d: discriminators){
+        std::vector<int> votes = d.second.classify(dataset[i]);
+        for(size_t j = 0; j < votes.size(); j++){
+          if(votes[j] > 0){
+            activations[d.first][j][sampleClass]++;
+            totalActivations[d.first][j]++;
+          }
+        }
+      }
+    }
+
+    // Compute weights from activation patterns.
+    ramWeights.clear();
+    int nClasses = (int)discriminators.size();
+
+    for(auto& d: discriminators){
+      int nRAMs = d.second.getNumberOfRAMS();
+      ramWeights[d.first].resize(nRAMs, 1.0);
+
+      for(int j = 0; j < nRAMs; j++){
+        int total = totalActivations[d.first][j];
+        if(total == 0){
+          ramWeights[d.first][j] = 0.0;
+          continue;
+        }
+
+        if(metric == "entropy"){
+          // Weight = 1 - normalized entropy of class distribution of activations
+          double entropy = 0.0;
+          for(auto& ac: activations[d.first][j]){
+            double p = (double)ac.second / total;
+            if(p > 0) entropy -= p * std::log2(p);
+          }
+          double maxEntropy = (nClasses > 1) ? std::log2((double)nClasses) : 1.0;
+          ramWeights[d.first][j] = 1.0 - entropy / maxEntropy;
+        }
+        else if(metric == "information_gain"){
+          // MI between binary RAM output (fires/doesn't) and class label
+          double nSamples = (double)dataset.size();
+          double pFire = total / nSamples;
+          double pNoFire = 1.0 - pFire;
+          double mi = 0.0;
+
+          for(auto& ac: activations[d.first][j]){
+            // Count total samples of this class
+            int classTotal = 0;
+            for(size_t s = 0; s < dataset.size(); s++){
+              if(dataset.getLabel(s) == ac.first) classTotal++;
+            }
+            double pClass = classTotal / nSamples;
+            // p(fire, class)
+            double pJoint = ac.second / nSamples;
+            if(pJoint > 0 && pFire > 0 && pClass > 0){
+              mi += pJoint * std::log2(pJoint / (pFire * pClass));
+            }
+            // p(no_fire, class)
+            double pJointNo = (classTotal - ac.second) / nSamples;
+            if(pJointNo > 0 && pNoFire > 0 && pClass > 0){
+              mi += pJointNo * std::log2(pJointNo / (pNoFire * pClass));
+            }
+          }
+          ramWeights[d.first][j] = mi;
+        }
+        else if(metric == "purity"){
+          // Fraction of activations belonging to this discriminator's class
+          auto it = activations[d.first][j].find(d.first);
+          int correctCount = (it != activations[d.first][j].end()) ? it->second : 0;
+          ramWeights[d.first][j] = (double)correctCount / total;
+        }
+      }
+    }
+
+    // Normalize weights to [0, 1] range per discriminator
+    for(auto& entry: ramWeights){
+      double maxW = 0.0;
+      for(double w: entry.second) if(w > maxW) maxW = w;
+      if(maxW > 0){
+        for(double& w: entry.second) w /= maxW;
+      }
+    }
+
+    useRAMWeights = true;
+  }
+
+  void setRAMWeights(const std::map<std::string, std::vector<double>>& weights){
+    ramWeights = weights;
+    useRAMWeights = true;
+  }
+
+  std::map<std::string, std::vector<double>> getRAMWeights() const{
+    return ramWeights;
+  }
+
+  void pruneRAMs(double threshold){
+    for(auto& entry: ramWeights){
+      for(size_t i = 0; i < entry.second.size(); i++){
+        if(entry.second[i] < threshold) entry.second[i] = 0.0;
+      }
+    }
   }
 
   std::map<std::string,std::vector<int>> getTupleSizes() const{
@@ -318,4 +531,22 @@ protected:
   bool balanced;
   bool softBleaching;
   bool crossClassScoring;
+
+  // Negative evidence
+  bool negativeEvidence;
+  double negativeAlpha;
+  std::string negativeMode;
+
+  // Weighted RAM voting
+  std::map<std::string, std::vector<double>> ramWeights;
+  bool useRAMWeights;
+
+  // Shared discriminator
+  bool useSharedDiscriminator;
+  double sharedBeta;
+  Discriminator sharedDiscrim;
+  bool sharedDiscriminatorInitialized;
+
+  // Attention-like weighting
+  bool attentionWeighting;
 };

@@ -56,6 +56,14 @@ namespace nl = nlohmann;
 #include "models/wisard/discriminator.cc"
 #include "models/wisard/wisard.cc"
 
+//bloomwisard model
+#include "models/bloomwisard/murmur3.h"
+#include "models/bloomwisard/lsh.h"
+#include "models/bloomwisard/bloomfilter.cc"
+#include "models/bloomwisard/bloomram.cc"
+#include "models/bloomwisard/bloomdiscriminator.cc"
+#include "models/bloomwisard/bloomwisard.cc"
+
 //cluswisard model
 #include "models/cluswisard/cluster.cc"
 #include "models/cluswisard/cluswisard.cc"
@@ -81,5 +89,6 @@ namespace py = pybind11;
 #include "wrappers/wisardwrapper.cc"
 #include "wrappers/cluswisardwrapper.cc"
 #include "wrappers/kernelcanvaswrapper.cc"
+#include "wrappers/bloomwisardwrapper.cc"
 #include "wrappers/regressionwisardwrapper.cc"
 #include "wrappers/clusregressionwisardwrapper.cc"

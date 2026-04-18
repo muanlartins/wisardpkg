@@ -82,13 +82,13 @@ protected:
             if (entrySize % tupleSize != 0 && completeAddressing) numRAMs++;
 
             unsigned int minSize = std::max((unsigned int)2, tupleSize / 2);
-            unsigned int maxSize = std::min((unsigned int)64, tupleSize * 3 / 2);
+            unsigned int maxSize = tupleSize * 3 / 2;
             if (maxSize < minSize) maxSize = minSize;
 
             // Generate linearly spaced sizes
             std::vector<unsigned int> sizes(numRAMs);
             if (numRAMs == 1) {
-                sizes[0] = std::min(entrySize, (unsigned int)64);
+                sizes[0] = entrySize;
             } else {
                 for (unsigned int i = 0; i < numRAMs; i++) {
                     double frac = (double)i / (double)(numRAMs - 1);
@@ -104,7 +104,7 @@ protected:
             int delta = (int)entrySize - (int)currentTotal;
             while (delta > 0) {
                 for (unsigned int i = numRAMs; i > 0 && delta > 0; i--) {
-                    if (sizes[i-1] < 64) { sizes[i-1]++; delta--; }
+                    sizes[i-1]++; delta--;
                 }
             }
             while (delta < 0) {

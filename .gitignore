@@ -20,3 +20,8 @@ __pycache__
 
 # ide
 .vscode
+.idea/wisardpkg.iml
+.idea/workspace.xml
+
+# macOS temp/build artifacts
+var/

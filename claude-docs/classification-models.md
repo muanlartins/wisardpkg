@@ -1,6 +1,6 @@
 # Classification Models
 
-Two classification models: **Wisard** (standard supervised) and **ClusWisard** (clustering-based, supports supervised/semi-supervised/unsupervised).
+Classification models: **Wisard** (standard supervised), **ClusWisard** (clustering-based, supports supervised/semi-supervised/unsupervised), and **BloomWisard** (counting-Bloom-filter-backed RAMs for memory-efficient inference).
 
 ## Wisard
 
@@ -95,6 +95,54 @@ tuple_sizes = wisard.getTupleSizes()
 | `mappingGenerator` | `MappingGenerator*` | RandomMapping | Custom mapping generator |
 | `indexes` | `vector<int>` | — | Custom input bit indices |
 | `mapping` | `map<str, vector<vector<int>>>` | — | Pre-computed per-class mappings |
+
+### Optional Classification Hooks
+
+These kwargs modify how per-class scores are computed at `classify()`/`rank()` time. All default off; existing callers are unaffected. They can be combined, and their order of application is: RAM weighting → attention weighting → cross-class scoring → bleaching/method → shared-discriminator subtraction → negative evidence.
+
+| Kwarg | Type | Default | Effect |
+|-------|------|---------|--------|
+| `negativeEvidence` | `bool` | false | Penalize each class's score by others' activations |
+| `negativeAlpha` | `float` | 0.0 | Penalty strength (0 = identity) |
+| `negativeMode` | `str` | `"uniform"` | One of `"uniform"`, `"max_competitor"`, `"normalized"` |
+| `sharedDiscriminator` | `bool` | false | Train a `__shared__` discriminator on all samples; subtract its response from every class score |
+| `sharedBeta` | `float` | 0.0 | Subtraction weight for the shared response |
+| `attentionWeighting` | `bool` | false | Down-weight per-RAM votes that disagree with the sample's own vote consensus |
+| `useRAMWeights` | (implicit) | false | Multiply per-RAM votes by a learned per-RAM weight before aggregation. Enabled by calling `computeRAMWeights(dataset, metric)` or `setRAMWeights(dict)` |
+
+Negative-evidence modes:
+
+- `"uniform"`: `score_c' = score_c - α · Σ_{c' ≠ c} score_{c'}` — every other class contributes equally.
+- `"max_competitor"`: `score_c' = score_c - α · max_{c' ≠ c} score_{c'}` — only the closest rival penalizes.
+- `"normalized"`: `score_c' = 1000 · score_c / (1 + α · Σ_{c' ≠ c} score_{c'})` — multiplicative normalization; integer-safe.
+
+RAM-weight metrics (via `computeRAMWeights(dataset, metric)`):
+
+- `"entropy"`: weight = `1 − H(class | RAM fires) / H_max`. RAMs whose firings concentrate in a single class get high weight; RAMs firing uniformly get near-zero weight.
+- `"information_gain"`: mutual information between binary RAM output (fires / doesn't) and class label.
+- `"purity"`: fraction of RAM firings that came from the correct class (the discriminator's own class).
+
+All metrics are normalized per-discriminator to `[0, 1]`. `pruneRAMs(threshold)` zeros every weight below the threshold; `getRAMWeights()` / `setRAMWeights(dict)` round-trip the weight map.
+
+```python
+# Negative evidence (three modes)
+w = wp.Wisard(3, negativeEvidence=True, negativeAlpha=0.3,
+              negativeMode="max_competitor")
+
+# RAM weighting
+w = wp.Wisard(3)
+w.train(X)
+w.computeRAMWeights(X, "information_gain")   # populates and activates weights
+w.pruneRAMs(0.1)                              # zero low-MI RAMs
+
+# Shared discriminator
+w = wp.Wisard(3, sharedDiscriminator=True, sharedBeta=0.1)
+
+# Attention weighting
+w = wp.Wisard(3, attentionWeighting=True)
+```
+
+**Intended use.** These hooks are experiment-oriented — they let you reproduce the techniques from `TechniquesExploration.ipynb` (negative evidence, weighted RAM voting, shared background discriminator, attention-like weighting). For the F4RM paper's canonical experiments, all hooks are disabled.
 
 ---
 
@@ -209,3 +257,74 @@ The adaptive limit `minScore + count/threshold` starts low (accepting most patte
 ### Label Format
 
 In supervised classification, ClusWisard labels output as `"class::cluster_index"` internally but returns the class portion to the user. In unsupervised mode, labels are plain cluster indices.
+
+---
+
+## BloomWisard
+
+**Source:** `src/models/bloomwisard/{bloomfilter,bloomram,bloomdiscriminator,bloomwisard}.cc`, `src/wrappers/bloomwisardwrapper.cc`
+
+A WiSARD variant where each RAM is replaced by a **counting Bloom filter**. Instead of storing one counter per seen address, each address is hashed into `numHashes` positions in a fixed-size `numBits`-slot counter array. Training increments all hashed slots; classification queries the minimum across them (the counting-Bloom-filter approximation of "how many times has this address been seen").
+
+The result: bounded memory per RAM (`numBits` slots regardless of how many distinct addresses are seen) at the cost of a controlled false-positive rate, while still supporting bleaching. BloomWisard is the standalone implementation of the Bloom-filter RAM backend used by ULEEN and related ultra-low-energy edge variants; here it is exposed directly so it can be swapped in wherever a `Wisard` would be used.
+
+### How It Works
+
+Each RAM holds a `BloomFilter(numBits, numHashes, hashMode)`:
+- **`add(key)`**: compute `numHashes` positions from `key`, increment each slot.
+- **`count(key)`**: return the minimum across the hashed slots — a lower bound on the number of times `key` was added.
+- **`query(key)`**: equivalent to `count(key) > 0`.
+
+At classification time, the discriminator's vote for a class is the sum of `count(address)` over all its RAMs, which then flows through the standard classification method (bleaching by default).
+
+### Hash Modes
+
+| `hashMode` | Implementation |
+|-----------|----------------|
+| `"murmur"` (default) | MurmurHash3 double-hashing: `h_i(x) = h1(x) + i · h2(x) mod numBits` |
+| `"simhash"` | LSH via random hyperplane projections — similar binary inputs map to similar hash positions |
+
+Use `"murmur"` for standard Bloom behavior; use `"simhash"` when you want similar patterns (in Hamming distance) to alias intentionally.
+
+### Python API
+
+```python
+import wisardpkg as wp
+
+bw = wp.BloomWisard(addressSize=3, numBits=1024, numHashes=3)
+bw.train(X)
+preds = bw.classify(X)
+scores = bw.rank(X[0])  # {"cold": int, "hot": int, ...}
+bw.reset()              # clear all Bloom filters in place
+
+# SimHash LSH variant
+bw = wp.BloomWisard(addressSize=3, numBits=1024, numHashes=3, hashMode="simhash")
+```
+
+### Constructor Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `addressSize` | `int` | required | Bits per RAM |
+| `numBits` | `int` | 1024 | Bloom-filter counter array size |
+| `numHashes` | `int` | 3 | Number of hash functions per key |
+| `hashMode` | `str` | `"murmur"` | `"murmur"` or `"simhash"` |
+| `classificationMethod` | `ClassificationBase*` | Bleaching | Same plug-in model as `Wisard` |
+| `ignoreZero` | `bool` | false | Skip the all-zero address |
+| `completeAddressing` | `bool` | true | Pad mappings |
+| `monoMapping` | `bool` | false | All classes share the same mapping |
+| `verbose` | `bool` | false | Print info |
+
+### When to Use BloomWisard vs Wisard
+
+| Situation | Use |
+|-----------|-----|
+| Small address sizes, plenty of memory | `Wisard` (exact counts) |
+| Large address sizes where `2^a` is unreasonable | `BloomWisard` (fixed memory, tunable FP rate) |
+| Memory-constrained deployment (edge, MCU) | `BloomWisard` |
+| Need similarity-based aliasing of near-patterns | `BloomWisard` with `hashMode="simhash"` |
+| Reproducing paper results that assume exact counts | `Wisard` |
+
+### Trade-off
+
+BloomWisard's false-positive rate rises with fill ratio. Rough guide: for target FP rate `p`, pick `numBits ≈ -n · ln(p) / (ln 2)^2` where `n` is the expected number of distinct addresses per RAM. `numHashes ≈ (numBits / n) · ln 2` minimizes FPR at that capacity. The defaults (`numBits=1024, numHashes=3`) are a reasonable starting point for moderate datasets.

@@ -29,9 +29,34 @@ A RAM node is a lookup table that maps a subset of input bits to a vote count.
 ### Storage
 
 ```cpp
-map<addr_t, content_t> positions;  // sparse: only stores seen addresses
-vector<int> addresses;              // which input bit indices this RAM reads
+map<addr_t, content_t> positions;       // sparse integer-keyed map (standard path)
+map<large_addr_t, content_t> largePositions;  // sparse string-keyed map (large-address path)
+vector<int> addresses;                   // which input bit indices this RAM reads
+bool useLargeAddr;                       // switch between the two paths
 ```
+
+**Standard path (`addressSize ≤ 64` with `base == 2`)**: the address is computed as a `uint64_t` via a base-N weighted sum. `positions` is a sparse `unordered_map<uint64_t, int>`.
+
+**Large-address path (`addressSize > 64` with `base == 2`)**: `uint64_t` can no longer hold a single address, so the RAM switches to a byte-packed string key. Each address becomes a `std::string` of `⌈addressSize / 8⌉` bytes with one bit per input bit:
+
+```cpp
+large_addr_t getLargeIndex(const BinInput& image) const {
+    int n = addresses.size();
+    int nbytes = (n + 7) / 8;
+    large_addr_t key(nbytes, '\0');
+    for (int i = 0; i < n; i++) {
+        if (image[addresses[i]])
+            key[i / 8] |= (char)(1 << (i % 8));
+    }
+    return key;
+}
+```
+
+`train`, `getVote`, `untrain`, `reset`, and `getsizeof` all dispatch on `useLargeAddr` and use `largePositions` when true. The mental-image reconstruction (`getMentalImage`) also has a large-address branch that decodes the per-byte bit pattern back into per-position vote accumulators.
+
+JSON serialization and deserialization are only supported on the standard path; a RAM trained with `addressSize > 64` serializes to an empty RAM block (deliberate: the experiments that need large addresses don't round-trip through JSON). Mixing the two paths in one model is safe — `useLargeAddr` is per-RAM.
+
+**Why this matters:** the original wisardpkg hard-capped addressSize at 64 via `checkLimitAddressSize`. That cap is dropped for `base == 2` specifically (other bases still enforce it), so experiments that need very large tuple sizes (e.g., full-image WiSARD on MNIST-scale inputs) can run without changing the model surface.
 
 ### Mental Image
 

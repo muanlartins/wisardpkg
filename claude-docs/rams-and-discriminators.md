@@ -140,6 +140,39 @@ Two methods for assigning input bits to RAMs:
 
 `getMentalImage()`: Aggregates mental images from all RAMs into a single vector of length `entrySize`, showing which input bits are most important for this class.
 
+### Per-RAM Weights and Pruning
+
+The `Wisard` model exposes a per-class, per-RAM weight vector that participates in `rank()` between the raw `Discriminator::classify` step and the bleaching/method aggregation. Weights are computed from a labelled dataset using one of three information-theoretic metrics, all normalised per-discriminator to `[0, 1]`:
+
+| Metric | Definition |
+|--------|------------|
+| `"entropy"` (default) | `1 − H(class | RAM fires) / H_max`. RAMs whose firings concentrate in a single class get high weight; RAMs firing uniformly across classes get near-zero weight. |
+| `"information_gain"` | Mutual information between binary RAM output (fires / doesn't) and the class label. |
+| `"purity"` | Fraction of RAM firings that came from the correct class (the discriminator's own class). |
+
+```python
+import wisardpkg as wp
+
+w = wp.Wisard(addressSize=4)
+w.train(X, y)
+
+# Compute and apply weights
+w.computeRAMWeights(X, "information_gain")     # populates and activates ramWeights
+
+# Inspect / round-trip
+weights = w.getRAMWeights()                      # {label: [w_0, w_1, ..., w_{n_rams-1}]}
+w.setRAMWeights(weights)                         # restore from a saved dict
+
+# Prune low-weight RAMs by zeroing their weight (RAMs aren't deleted, just silenced)
+w.pruneRAMs(0.1)                                 # any weight < 0.1 → 0
+```
+
+Once `computeRAMWeights` or `setRAMWeights` is called, the `useRAMWeights` flag is set internally and `rank()` will multiply each RAM's vote by its weight on the way through the hook pipeline (see `classification-models.md` for the hook order). To deactivate, call `setRAMWeights({})` or set all weights to 1.
+
+`pruneRAMs(threshold)` sets every weight below `threshold` to 0; high-weight RAMs are unchanged. This is a soft prune — the underlying RAM storage is preserved, only the contribution to votes is suppressed.
+
+**Source:** `src/models/wisard/wisard.cc:378–530` (computation, get/set, prune); `src/wrappers/wisardwrapper.cc` exposes the four entry points to Python.
+
 ### Serialization
 
 `json()` outputs the full discriminator state including all RAM positions, entry size, count, and configuration. Supports optional `RAMDataHandle` for external RAM data storage.

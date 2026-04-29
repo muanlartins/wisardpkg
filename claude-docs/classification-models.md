@@ -2,6 +2,8 @@
 
 Classification models: **Wisard** (standard supervised), **ClusWisard** (clustering-based, supports supervised/semi-supervised/unsupervised), and **BloomWisard** (counting-Bloom-filter-backed RAMs for memory-efficient inference).
 
+For Python-side ports of recent weightless architectures that build on top of these models — **BTHOWeN** (PACT 2022), **DWN** (ICML 2024), **ULEEN** (ACM TACO 2023) — see `python-models.md`.
+
 ## Wisard
 
 **Source:** `src/models/wisard/wisard.cc`, `src/wrappers/wisardwrapper.cc`
@@ -98,7 +100,16 @@ tuple_sizes = wisard.getTupleSizes()
 
 ### Optional Classification Hooks
 
-These kwargs modify how per-class scores are computed at `classify()`/`rank()` time. All default off; existing callers are unaffected. They can be combined, and their order of application is: RAM weighting → attention weighting → cross-class scoring → bleaching/method → shared-discriminator subtraction → negative evidence.
+These kwargs modify how per-class scores are computed at `classify()`/`rank()` time. All default off; existing callers are unaffected. They can be combined, and their order of application inside `wisard.cc::rank()` is:
+
+1. base RAM votes per class (`Discriminator::classify`)
+2. **multi-resolution reweight** — multiply each RAM's vote by its tuple size (only when `mappingGenerator->multiResolution == true`)
+3. **`useRAMWeights`** — multiply each RAM's vote by its learned per-RAM weight
+4. **`attentionWeighting`** — multiply each RAM's vote by `1 − |vote − mean| / max`
+5. **`crossClassScoring`** — normalise each RAM's vote by the cross-class total
+6. **`softBleaching`** vs `classificationMethod->run()` — aggregate per-RAM votes into per-class scalars
+7. **`sharedDiscriminator`** — subtract the `__shared__` discriminator's response (scaled by `sharedBeta`)
+8. **`negativeEvidence`** — penalise each class by some function of competing classes' scores
 
 | Kwarg | Type | Default | Effect |
 |-------|------|---------|--------|
@@ -108,6 +119,8 @@ These kwargs modify how per-class scores are computed at `classify()`/`rank()` t
 | `sharedDiscriminator` | `bool` | false | Train a `__shared__` discriminator on all samples; subtract its response from every class score |
 | `sharedBeta` | `float` | 0.0 | Subtraction weight for the shared response |
 | `attentionWeighting` | `bool` | false | Down-weight per-RAM votes that disagree with the sample's own vote consensus |
+| `softBleaching` | `bool` | false | Replace `classificationMethod` with an iterative soft-bleaching loop that progressively lowers the threshold until ambiguity resolves |
+| `crossClassScoring` | `bool` | false | Per-RAM index `j`: rescale each class's vote by `n_classes / (1 + total_j)` so RAMs that fire for many classes contribute less |
 | `useRAMWeights` | (implicit) | false | Multiply per-RAM votes by a learned per-RAM weight before aggregation. Enabled by calling `computeRAMWeights(dataset, metric)` or `setRAMWeights(dict)` |
 
 Negative-evidence modes:
@@ -283,8 +296,9 @@ At classification time, the discriminator's vote for a class is the sum of `coun
 |-----------|----------------|
 | `"murmur"` (default) | MurmurHash3 double-hashing: `h_i(x) = h1(x) + i · h2(x) mod numBits` |
 | `"simhash"` | LSH via random hyperplane projections — similar binary inputs map to similar hash positions |
+| `"h3"` | H3 universal hashing (Carter & Wegman, 1979): for each hash `i`, XOR the precomputed random constants `H[i, j]` over the bits where `key[j] == 1`, then reduce mod `numBits`. This is the hash family used by BTHOWeN. |
 
-Use `"murmur"` for standard Bloom behavior; use `"simhash"` when you want similar patterns (in Hamming distance) to alias intentionally.
+Use `"murmur"` for standard Bloom behavior; use `"simhash"` when you want similar patterns (in Hamming distance) to alias intentionally; use `"h3"` to reproduce BTHOWeN-style training (the `wisardpkg.models.BTHOWeN` wrapper sets this for you). H3 constants are initialised per-RAM via `initH3(keyLength)` once `addressSize` (and thus the per-RAM key length) is known; this happens automatically when training begins.
 
 ### Python API
 
@@ -299,6 +313,11 @@ bw.reset()              # clear all Bloom filters in place
 
 # SimHash LSH variant
 bw = wp.BloomWisard(addressSize=3, numBits=1024, numHashes=3, hashMode="simhash")
+
+# H3 universal hashing (BTHOWeN-style)
+bw = wp.BloomWisard(addressSize=8, numBits=1024, numHashes=3, hashMode="h3")
+bw.train(ds)
+raw = bw.getRawVotes(some_bin_input)  # {label: [min_count_per_RAM, ...]}
 ```
 
 ### Constructor Parameters
@@ -308,12 +327,32 @@ bw = wp.BloomWisard(addressSize=3, numBits=1024, numHashes=3, hashMode="simhash"
 | `addressSize` | `int` | required | Bits per RAM |
 | `numBits` | `int` | 1024 | Bloom-filter counter array size |
 | `numHashes` | `int` | 3 | Number of hash functions per key |
-| `hashMode` | `str` | `"murmur"` | `"murmur"` or `"simhash"` |
+| `hashMode` | `str` | `"murmur"` | `"murmur"`, `"simhash"`, or `"h3"` |
 | `classificationMethod` | `ClassificationBase*` | Bleaching | Same plug-in model as `Wisard` |
 | `ignoreZero` | `bool` | false | Skip the all-zero address |
 | `completeAddressing` | `bool` | true | Pad mappings |
 | `monoMapping` | `bool` | false | All classes share the same mapping |
 | `verbose` | `bool` | false | Print info |
+
+### Inspecting raw votes (`getRawVotes`)
+
+`rank()` returns one aggregated integer per class — the standard Bloom-WiSARD vote summed over all RAMs. `getRawVotes()` returns the **per-RAM Bloom min-counts** before any threshold is applied, so external code can implement custom bleaching strategies on top of it:
+
+```cpp
+std::map<std::string, std::vector<int>>             getRawVotes(const BinInput&);
+std::vector<std::map<std::string, std::vector<int>>> getRawVotes(const DataSet&);
+```
+
+```python
+raw = bw.getRawVotes(bin_input)
+# {"cold": [min_count_RAM0, min_count_RAM1, ...], "hot": [...]}
+
+# Apply a custom bleach β: vote = number of RAMs whose min-count ≥ β
+def vote(raw, label, beta):
+    return sum(1 for c in raw[label] if c >= beta)
+```
+
+This is what `wisardpkg.models.BTHOWeN` uses to drive its binary-search bleach tuning loop — see `python-models.md`.
 
 ### When to Use BloomWisard vs Wisard
 

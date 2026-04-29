@@ -103,12 +103,29 @@ rm.setMappings({"cold": [[0,1,2],[3,4,5]], "hot": [[2,1,0],[5,4,3]]})
 | `tupleSize` | `unsigned int` | — | Bits per RAM group |
 | `monoMapping` | `bool` | false | Share one mapping across all labels |
 | `completeAddressing` | `bool` | true | Pad to fill all RAM slots |
+| `multiResolution` | `bool` | false | Variable-size RAMs (see below) |
 
 ### Complete Addressing Example
 
 entrySize=10, tupleSize=3:
 - Without complete addressing: 3 RAMs of 3 bits + 1 RAM of 1 bit = 4 RAMs
 - With complete addressing: pad to 12 indices (add 2 random duplicates), then 4 RAMs of 3 bits each
+
+### Multi-Resolution Mapping
+
+When `multiResolution=true`, RAM tuple sizes are no longer uniform — they are linearly spaced from `max(2, tupleSize/2)` to `tupleSize * 3/2`, then perturbed to cover exactly `entrySize` bits, then shuffled so position doesn't determine size. The result is a mapping where some RAMs see fewer bits (`addressSize/2`-ish, more general) and others see more (`addressSize·3/2`-ish, more specific), giving the network a multi-scale view of the input.
+
+`Wisard::rank()` knows about this mode: when `multiResolution=true` it multiplies each RAM's vote by that RAM's tuple size before bleaching, so larger RAMs get proportionally more weight. Without that reweighting, smaller RAMs would dominate purely because they fire more often. The reweight happens in `wisard.cc:221-231`.
+
+```python
+rm = wp.RandomMapping(entrySize=64, tupleSize=8, multiResolution=True)
+w = wp.Wisard(addressSize=8, mappingGenerator=rm)
+# OR pass it directly as a Wisard kwarg (the WisardWrapper forwards it
+# onto the embedded mappingGenerator):
+w = wp.Wisard(addressSize=8, multiResolution=True)
+```
+
+This is experiment-oriented; the F4RM paper's canonical experiments use uniform tuple sizes.
 
 ## Registry (Serialization)
 

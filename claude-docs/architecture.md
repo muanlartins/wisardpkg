@@ -24,12 +24,16 @@ This makes training a single write operation and inference a single read — ext
 Model (abstract)
 ├── ClassificationModel
 │   ├── Wisard → WisardWrapper (Python-exposed)
-│   └── ClusWisard → ClusWisardWrapper (Python-exposed)
+│   ├── ClusWisard → ClusWisardWrapper (Python-exposed)
+│   └── BloomWisard → BloomWisardWrapper (Python-exposed)
+│         └── BloomDiscriminator → BloomRAM → BloomFilter (counting Bloom filter
+│             with MurmurHash3 / SimHash LSH / H3 universal-hash modes)
 └── RegressionModel
     ├── RegressionWisard → RegressionWisardWrapper (Python-exposed)
     └── ClusRegressionWisard → ClusRegressionWisardWrapper (Python-exposed)
 
 Discriminator → DiscriminatorWrapper (Python-exposed, standalone use)
+RAM (standard ≤64-bit address path AND large-address >64-bit string-key path)
 
 ClassificationBase (strategy pattern)
 ├── Bleaching
@@ -38,7 +42,7 @@ ClassificationBase (strategy pattern)
 └── Weighted
 
 MappingGenerator (abstract)
-└── RandomMapping
+└── RandomMapping (uniform OR multi-resolution tuple sizes)
 
 BinBase (abstract binarization)
 ├── Thresholding
@@ -49,6 +53,8 @@ BinBase (abstract binarization)
 ├── GaussianThermometer          (fit-based, per-feature Gaussian CDF thresholds)
 ├── ExponentialThermometer       (fit-based, per-feature Exponential CDF thresholds)
 ├── StochasticThermometer        (fit+optimize, coordinate descent on thresholds)
+├── SupervisedThermometer        (fit-based, label-aware: class_conditional /
+│                                  mi_allocation / entropy_weighted)
 └── KernelCanvas → KernelCanvasWrapper (Python-exposed)
 
 Mean (abstract regression aggregation)
@@ -60,6 +66,11 @@ Mean (abstract regression aggregation)
 ├── GeometricMean
 ├── ExponentialMean
 └── LogisticMean
+
+# Python-side ports (wisardpkg.models — pure Python, optional torch dep)
+BTHOWeN          (Susskind PACT 2022 — built on BloomWisard + GaussianThermometer + H3)
+DWNClassifier    (Bacellar ICML 2024 — pure PyTorch, EFD CPU port)
+ULEENClassifier  (Susskind ACM TACO 2023 — pure PyTorch, continuous Bloom filters)
 ```
 
 ## Data Flow
@@ -91,7 +102,7 @@ All source is in `src/` as `.cc` files included from the master header `wisardpk
 | Directory | Purpose |
 |-----------|---------|
 | `src/common/` | Type definitions (`definetypes.cc`), utilities (`utils.cc`), exceptions (`exceptions.cc`) |
-| `src/binarization/` | Binary encoding techniques (`binbase.cc`, `thresholding.cc`, `meanthresholding.cc`, `thermometer.cc`, `distributivethermometer.cc`, `gaussianthermometer.cc`, `exponentialthermometer.cc`, `stochasticthermometer.cc`, `kernelcanvas.cc`) |
+| `src/binarization/` | Binary encoding techniques (`binbase.cc`, `thresholding.cc`, `meanthresholding.cc`, `thermometer.cc`, `distributivethermometer.cc`, `gaussianthermometer.cc`, `exponentialthermometer.cc`, `stochasticthermometer.cc`, `supervisedthermometer.cc`, `kernelcanvas.cc`) |
 | `src/classification_methods/` | Vote aggregation strategies (`bleaching.cc`, `bestbleaching.cc`, `bbleaching.cc`, `weighted.cc`, `register.cc`) |
 | `src/mapping/` | Input-to-RAM bit assignment (`mappinggenerator.cc`, `randommapping.cc`, `mappinggeneratorhelper.cc`) |
 | `src/data/` | Data containers (`bininput.cc`, `dataset.cc`) |
@@ -99,9 +110,12 @@ All source is in `src/` as `.cc` files included from the master header `wisardpk
 | `src/models/base/` | Abstract model interfaces (`model.cc`, `classificationmodel.cc`, `regressionmodel.cc`) |
 | `src/models/wisard/` | Core WiSARD (`ram.cc`, `discriminator.cc`, `wisard.cc`, `ramdatahandle.cc`) |
 | `src/models/cluswisard/` | Clustering WiSARD (`cluster.cc`, `cluswisard.cc`) |
+| `src/models/bloomwisard/` | Counting-Bloom-filter WiSARD (`bloomfilter.cc`, `bloomram.cc`, `bloomdiscriminator.cc`, `bloomwisard.cc`, `lsh.h`, `murmur3.h`) |
 | `src/models/regressionwisard/` | Regression variant (`regressionram.cc`, `regressionwisard.cc`, `meanfunctions.cc`, `regressionramdatahandle.cc`) |
 | `src/models/clusregressionwisard/` | Clustering regression (`clusregressionwisard.cc`) |
 | `src/wrappers/` | PyBind11 wrappers that handle `py::kwargs` → C++ member assignment |
+| `wisardpkg/` | Python package layer: re-exports the C++ core as `wisardpkg._native`, adds `wisardpkg.models` subpackage with BTHOWeN / DWN / ULEEN ports |
+| `scripts/sweeps/` | Hyperparameter sweep drivers for reproducing the F4RM paper's prior-WiSARD comparison numbers |
 
 ## Key Design Patterns
 
@@ -149,7 +163,27 @@ Models serialize to JSON via `json()` methods. RAMDataHandle and RegressionRAMDa
 
 ## Key Source Files
 
-- **Entry point**: `src/wisard_bind.cc` — defines the `PYBIND11_MODULE(wisardpkg, m)` with all class bindings
+- **Entry point**: `src/wisard_bind.cc` — defines `PYBIND11_MODULE(_native, m)` with all class bindings (the module name `_native` is set via `setup.py` so the extension lands at `wisardpkg/_native.…so`)
 - **Master header**: `src/wisardpkg.h` — includes everything in dependency order
 - **Version**: `src/version.h` — single `__version__` constant
 - **JSON library**: `src/libs/json.hpp` — nlohmann/json (vendored)
+- **Python package**: `wisardpkg/__init__.py` re-exports `wisardpkg._native.*` so `import wisardpkg as wp` works unchanged; `wisardpkg/models/` adds BTHOWeN (always available) and DWN/ULEEN (require optional `torch` extra)
+
+## Python Package Layer
+
+The build now produces a real Python package, not a single top-level extension:
+
+```
+wisardpkg/
+├── __init__.py              # re-exports wisardpkg._native.*
+├── _native.cpython-…so      # the C++ extension (built from src/wisard_bind.cc)
+└── models/
+    ├── __init__.py          # exports BTHOWeN; DWN/ULEEN via PEP 562 lazy import
+    ├── bthowen.py           # uses wp.BloomWisard + wp.GaussianThermometer
+    ├── dwn.py               # pure PyTorch (no C++ dependency)
+    └── uleen.py             # pure PyTorch (no C++ dependency)
+```
+
+The user-facing API is preserved: `import wisardpkg as wp; wp.Wisard(...)` works exactly as before. The new `wisardpkg.models` subpackage adds Python-side ports of three recent weightless architectures — see `python-models.md` for the full reference.
+
+The optional `torch` extra (`pip install ".[torch]"`) gates DWN and ULEEN; BTHOWeN is always available because it only uses the C++ core.

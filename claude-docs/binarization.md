@@ -2,11 +2,12 @@
 
 WiSARD operates on binary inputs. Binarization techniques convert real-valued (continuous) data into binary vectors suitable for the model. All binarizers inherit from `BinBase` and implement `transform()`.
 
-**Source files:** `src/binarization/` — `binbase.cc`, `thresholding.cc`, `meanthresholding.cc`, `thermometer.cc`, `distributivethermometer.cc`, `gaussianthermometer.cc`, `exponentialthermometer.cc`, `stochasticthermometer.cc`, `kernelcanvas.cc`
+**Source files:** `src/binarization/` — `binbase.cc`, `thresholding.cc`, `meanthresholding.cc`, `thermometer.cc`, `distributivethermometer.cc`, `gaussianthermometer.cc`, `exponentialthermometer.cc`, `stochasticthermometer.cc`, `supervisedthermometer.cc`, `kernelcanvas.cc`
 
-There are two categories of thermometers:
+There are three categories of thermometers:
 - **Static** (thresholds set at construction): SimpleThermometer, DynamicThermometer
-- **Fitted** (thresholds learned from training data via `fit()`): Distributive, Gaussian, Exponential, Stochastic
+- **Fitted, unsupervised** (thresholds learned from data via `fit()`): Distributive, Gaussian, Exponential, Stochastic
+- **Fitted, supervised** (thresholds learned from data + labels via `fit(X, y)`): Supervised (3 methods: class_conditional, mi_allocation, entropy_weighted)
 
 ## Base Class: BinBase
 

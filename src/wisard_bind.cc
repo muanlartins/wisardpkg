@@ -1,6 +1,6 @@
 #include "wisardpkg.h"
 
-PYBIND11_MODULE(wisardpkg, m){
+PYBIND11_MODULE(_native, m){
     m.attr("__version__") = __version__;
     m.attr("ramdata_sufix") = ramdata_sufix;
     m.attr("config_sufix") = config_sufix;
@@ -283,6 +283,12 @@ PYBIND11_MODULE(wisardpkg, m){
       .def("reset", &BloomWisardWrapper::reset)
       .def("rank", (std::map<std::string, int> (BloomWisardWrapper::*)(const BinInput&) const) &BloomWisardWrapper::rank)
       .def("rank", (std::vector<std::map<std::string, int>> (BloomWisardWrapper::*)(const DataSet&) const) &BloomWisardWrapper::rank)
+      .def("getRawVotes", (std::map<std::string, std::vector<int>> (BloomWisardWrapper::*)(const BinInput&) const) &BloomWisardWrapper::getRawVotes)
+      .def("getRawVotes", (std::vector<std::map<std::string, std::vector<int>>> (BloomWisardWrapper::*)(const DataSet&) const) &BloomWisardWrapper::getRawVotes)
+      .def("getNumberOfRAMS", &BloomWisardWrapper::getNumberOfRAMS)
+      .def("getNumBits", &BloomWisardWrapper::getNumBits)
+      .def("getNumHashes", &BloomWisardWrapper::getNumHashes)
+      .def("getHashMode", &BloomWisardWrapper::getHashMode)
     ;
 
     py::class_<ClusWisardWrapper, ClassificationModel>(m, "ClusWisard", py::module_local())

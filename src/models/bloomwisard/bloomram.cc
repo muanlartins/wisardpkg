@@ -14,6 +14,10 @@ public:
     filter.initSimHash((int)addresses.size());
   }
 
+  void initH3() {
+    filter.initH3((int)addresses.size());
+  }
+
   void train(const BinInput& image) {
     std::vector<int> key = getKey(image);
     if (ignoreZero && isZeroKey(key)) return;

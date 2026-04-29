@@ -20,6 +20,7 @@ with open("src/version.h") as f:
 
 __package_name__ = 'wisardpkg'
 __src__ = 'src/wisard_bind.cc'
+__ext_name__ = 'wisardpkg._native'  # built as a submodule of the Python package
 
 class get_pybind_include(object):
     """Helper class to determine the pybind11 include path
@@ -37,7 +38,7 @@ class get_pybind_include(object):
 
 ext_modules = [
     Extension(
-        __package_name__,
+        __ext_name__,  # builds as wisardpkg/_native.cpython-…so inside the package
         [__src__],
         include_dirs=[
             # Path to pybind11 headers
@@ -114,7 +115,13 @@ setup(
     long_description=long_description,
     long_description_content_type="text/markdown",
     ext_modules=ext_modules,
+    packages=['wisardpkg', 'wisardpkg.models'],
     install_requires=['pybind11>=2.2'],
+    extras_require={
+        # Optional torch-based models (DWN, ULEEN). Install with:
+        #   pip install .[torch]
+        'torch': ['torch>=2.0', 'numpy>=1.21'],
+    },
     cmdclass={'build_ext': BuildExt},
     zip_safe=False,
     keywords = ['wisard', 'weithgless', 'neural', 'net'],

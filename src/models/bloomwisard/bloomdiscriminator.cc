@@ -12,6 +12,8 @@ public:
       rams.push_back(BloomRAM(mapping[i], numBits, numHashes, ignoreZero, base, hashMode));
       if (hashMode == "simhash") {
         rams.back().initSimHash();
+      } else if (hashMode == "h3") {
+        rams.back().initH3();
       }
     }
   }

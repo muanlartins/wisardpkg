@@ -65,6 +65,36 @@ class BloomWisardTestCase(TestCase):
         except (RuntimeError, TypeError):
             self.fail("BloomWisard with hashMode='simhash' failed")
 
+    def test_hash_mode_h3(self):
+        # H3 universal hashing (Carter & Wegman 1979) — used by BTHOWeN.
+        bwsd = wp.BloomWisard(
+            addressSize=3, numBits=1024, numHashes=3, hashMode="h3"
+        )
+        bwsd.train(self.X)
+        preds = bwsd.classify(self.X)
+        self.assertEqual(len(preds), len(self.y))
+        # On this separable toy set H3 should also classify correctly.
+        correct = sum(1 for p, t in zip(preds, self.y) if p == t)
+        self.assertGreaterEqual(correct / len(self.y), 0.7)
+        # New accessors should report the configured values back.
+        self.assertEqual(bwsd.getHashMode(), "h3")
+        self.assertEqual(bwsd.getNumBits(), 1024)
+        self.assertEqual(bwsd.getNumHashes(), 3)
+        self.assertGreater(bwsd.getNumberOfRAMS(), 0)
+
+    def test_get_raw_votes(self):
+        # getRawVotes exposes per-RAM Bloom-filter min-counts per class —
+        # used by BTHOWeN's bleach binary search.
+        bwsd = wp.BloomWisard(addressSize=3, numBits=128, numHashes=2)
+        bwsd.train(self.X)
+        raw = bwsd.getRawVotes(self.X[0])
+        # Returned dict has one entry per class with one int per RAM.
+        self.assertIn("cold", raw)
+        self.assertIn("hot", raw)
+        n_rams = bwsd.getNumberOfRAMS()
+        self.assertEqual(len(raw["cold"]), n_rams)
+        self.assertEqual(len(raw["hot"]), n_rams)
+
     def test_reset(self):
         bwsd = wp.BloomWisard(addressSize=3)
         bwsd.train(self.X)

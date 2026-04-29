@@ -1,6 +1,7 @@
 // Counting Bloom filter for Bloom WiSARD RAM nodes.
 // Stores integer counters instead of bits, enabling bleaching (threshold-based voting).
-// Supports MurmurHash3 double-hashing and SimHash LSH.
+// Supports MurmurHash3 double-hashing, SimHash LSH, and H3 universal hashing
+// (Carter & Wegman, 1979) — the hash family used by BTHOWeN (Susskind et al., PACT 2022).
 
 class BloomFilter {
 public:
@@ -13,6 +14,18 @@ public:
 
   void initSimHash(int inputDim) {
     simHasher = SimHasher(numBits, numHashes, inputDim);
+  }
+
+  // Initialise H3 random constants (numHashes rows, keyLength columns) for a given
+  // RAM tuple size. Each hash is XOR over the columns where the bitvector key is 1,
+  // reduced modulo numBits. This matches the reference BTHOWeN implementation.
+  void initH3(int keyLength) {
+    h3Constants.assign(numHashes, std::vector<uint64_t>(keyLength));
+    for (int i = 0; i < numHashes; i++) {
+      for (int j = 0; j < keyLength; j++) {
+        h3Constants[i][j] = (uint64_t)((uint64_t)rand() * RAND_MAX + (uint64_t)rand());
+      }
+    }
   }
 
   void add(const std::vector<int>& key) {
@@ -66,6 +79,20 @@ private:
       return simHasher.computeHashes(key);
     }
 
+    if (hashMode == "h3") {
+      // H3: for each hash function i, XOR all h3Constants[i][j] where key[j] == 1,
+      // then reduce modulo numBits. h3Constants must be initialised via initH3().
+      std::vector<int> positions(numHashes);
+      for (int i = 0; i < numHashes; i++) {
+        uint64_t h = 0;
+        for (size_t j = 0; j < key.size(); j++) {
+          if (key[j]) h ^= h3Constants[i][j];
+        }
+        positions[i] = (int)(h % (uint64_t)numBits);
+      }
+      return positions;
+    }
+
     // MurmurHash3 double-hashing: h(i) = (h1 + i * h2) % numBits
     // Pack key into bytes for hashing.
     int keyBytes = (int)(key.size() * sizeof(int));
@@ -84,4 +111,5 @@ private:
   std::string hashMode;
   std::vector<int> counters;
   SimHasher simHasher;
+  std::vector<std::vector<uint64_t>> h3Constants;  // [numHashes][keyLength], used when hashMode == "h3"
 };

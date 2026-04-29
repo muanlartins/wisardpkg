@@ -93,6 +93,36 @@ public:
     return out;
   }
 
+  // Returns the raw per-RAM vote vector for each class, before any bleaching
+  // is applied. Each vector entry is the counting-Bloom-filter min-count for
+  // that RAM. Lets Python drive a custom bleach-search loop (used by BTHOWeN).
+  std::map<std::string, std::vector<int>> getRawVotes(const BinInput& image) const {
+    std::map<std::string, std::vector<int>> allvotes;
+    for (auto& i : discriminators) {
+      allvotes[i.first] = i.second.classify(image);
+    }
+    return allvotes;
+  }
+
+  std::vector<std::map<std::string, std::vector<int>>> getRawVotes(const DataSet& images) const {
+    std::vector<std::map<std::string, std::vector<int>>> out(images.size());
+    for (unsigned int i = 0; i < images.size(); i++) {
+      out[i] = getRawVotes(images[i]);
+    }
+    return out;
+  }
+
+  // Number of RAMs per discriminator (uniform across discriminators after training).
+  // Returns 0 if the model has not yet been trained.
+  int getNumberOfRAMS() const {
+    if (discriminators.empty()) return 0;
+    return discriminators.begin()->second.getNumberOfRAMS();
+  }
+
+  int getNumBits() const { return numBits; }
+  int getNumHashes() const { return numHashes; }
+  std::string getHashMode() const { return hashMode; }
+
   void reset() {
     for (auto& d : discriminators) {
       d.second.reset();

@@ -18,6 +18,11 @@ public:
       return new RandomMapping(params);
     }
 
+    if(className.compare("Local2DMapping")==0){
+      nl::json params = config[MappingGeneratorHelper::params];
+      return new Local2DMapping(params);
+    }
+
     return new RandomMapping();
   }
 private:

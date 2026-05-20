@@ -74,5 +74,11 @@ public:
       if(std::string(py::str(arg.first)).compare("attentionWeighting") == 0)
         attentionWeighting = arg.second.cast<bool>();
     }
+
+    // If a custom mappingGenerator was supplied via kwargs, the base constructor's
+    // setTupleSize(addressSize) call was applied to the *default* RandomMapping that
+    // we just replaced — re-apply it here so the Wisard's addressSize is authoritative
+    // regardless of how the mapping was constructed.
+    mappingGenerator->setTupleSize(addressSize);
   }
 };

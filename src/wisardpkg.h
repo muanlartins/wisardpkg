@@ -25,6 +25,7 @@ namespace nl = nlohmann;
 //mapping generators
 #include "mapping/mappinggenerator.cc"
 #include "mapping/randommapping.cc"
+#include "mapping/local2dmapping.cc"
 #include "mapping/mappinggeneratorhelper.cc"
 
 //data
@@ -44,6 +45,7 @@ namespace nl = nlohmann;
 #include "binarization/gaussianthermometer.cc"
 #include "binarization/exponentialthermometer.cc"
 #include "binarization/supervisedthermometer.cc"
+#include "binarization/colormaskbinarization.cc"
 
 //models
 #include "models/base/model.cc"

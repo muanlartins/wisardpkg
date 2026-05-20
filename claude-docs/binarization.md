@@ -9,6 +9,8 @@ There are three categories of thermometers:
 - **Fitted, unsupervised** (thresholds learned from data via `fit()`): Distributive, Gaussian, Exponential, Stochastic
 - **Fitted, supervised** (thresholds learned from data + labels via `fit(X, y)`): Supervised (3 methods: class_conditional, mi_allocation, entropy_weighted)
 
+Plus one non-thermometer specialized encoder: **ColorMaskBinarization** for objects with a known small palette (see below).
+
 ## Base Class: BinBase
 
 ```cpp
@@ -398,6 +400,60 @@ binary = st.transform(sample.tolist())
 | `rounds` | `int` | 5 | Full passes over all thresholds |
 | `stepsPerThreshold` | `int` | 100 | Positions tested per threshold |
 | `numThreads` | `int` | 0 | Number of threads (0 = auto-detect) |
+
+---
+
+## ColorMaskBinarization
+
+Hand-tuned colour-mask binariser for images whose target class has a small known palette. Originally introduced for *Where's Waldo* (red+white sweater, dark hair/glasses/beanie) — but applies to any task where you can name the colours you care about in advance.
+
+**Source:** `src/binarization/colormaskbinarization.cc`
+
+Unlike thermometers (which are ordinal and treat every channel the same way), `ColorMaskBinarization` emits 3 *categorical* bits per pixel based on hand-picked colour predicates:
+
+| Bit | Predicate | Default thresholds |
+|-----|-----------|--------------------|
+| `is_red`   | `R > redMin` AND `R - G > redChannelGap` AND `R - B > redChannelGap` | `redMin=0.5`, `redChannelGap=0.10` |
+| `is_white` | `R > whiteMin` AND `G > whiteMin` AND `B > whiteMin` | `whiteMin=0.75` |
+| `is_dark`  | `R < darkMax` AND `G < darkMax` AND `B < darkMax` | `darkMax=0.20` |
+
+The redness predicate uses *relative* channel gaps (`R - G`, `R - B`) rather than absolute caps on G and B, so it tolerates lighting variation (a Waldo crop in shadow still has `R >> G,B` even when R drops to 0.45).
+
+**Python API:**
+
+```python
+import wisardpkg as wp
+import numpy as np
+
+cm = wp.ColorMaskBinarization()                            # Waldo defaults
+cm = wp.ColorMaskBinarization(redMin=0.55, whiteMin=0.80)  # custom
+
+# Input: flat RGB triples, row-major, values in [0,1].
+patch_rgb = np.asarray(image, dtype=np.float32) / 255.0    # shape (H,W,3)
+bits = cm.transform(patch_rgb.flatten().tolist())          # BinInput of size 3*H*W
+print(bits.size())  # 3 bits per pixel
+```
+
+**Properties:**
+
+- Input/output ratio: 1:1 in *pixels* (each pixel → 3 bits regardless of channel count). Independent of image size.
+- 3 bits per pixel — typically 4× smaller than a `SimpleThermometer(4)` on RGB, and the bits carry task-relevant semantics rather than ordinal magnitude.
+- Mutually exclusive at typical thresholds (a pixel cannot be both white and dark), but not exhaustive — most pixels in a natural image fire zero of the three bits.
+- No `fit()` — thresholds are constructor parameters.
+
+**Constructor parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `redMin` | `double` | 0.5 | Minimum R channel value for the `is_red` predicate |
+| `redChannelGap` | `double` | 0.10 | Minimum gap `R - G` and `R - B` for `is_red` |
+| `whiteMin` | `double` | 0.75 | Minimum value across all three channels for `is_white` |
+| `darkMax` | `double` | 0.20 | Maximum value across all three channels for `is_dark` |
+
+**Tuning notes:**
+
+- Inspect predicate density before training: `bits.list().count(1) / bits.size()` should be a few percent on a typical natural image; if it's > 30%, thresholds are too lax and you've blunted the encoding.
+- For non-Waldo palettes, replace the predicates wholesale — the class is intentionally short, copy-paste-and-tweak rather than overengineer a generic palette DSL.
 
 ---
 

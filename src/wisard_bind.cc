@@ -87,6 +87,18 @@ PYBIND11_MODULE(_native, m){
       .def(py::init<>())
     ;
 
+    py::class_<ColorMaskBinarization, BinBase>(m, "ColorMaskBinarization", py::module_local())
+      .def(py::init<double, double, double, double>(),
+           py::arg("redMin") = 0.5,
+           py::arg("redChannelGap") = 0.10,
+           py::arg("whiteMin") = 0.75,
+           py::arg("darkMax") = 0.20)
+      .def("getRedMin",        &ColorMaskBinarization::getRedMin)
+      .def("getRedChannelGap", &ColorMaskBinarization::getRedChannelGap)
+      .def("getWhiteMin",      &ColorMaskBinarization::getWhiteMin)
+      .def("getDarkMax",       &ColorMaskBinarization::getDarkMax)
+    ;
+
     py::class_<SimpleThermometer, BinBase>(m, "SimpleThermometer", py::module_local())
       .def(py::init<const size_t, const double, const double>(), py::arg("thermometerSize") = 2, py::arg("minimum") = 0.0, py::arg("maximum") = 1.0)
       .def("getSize", &SimpleThermometer::getSize)
@@ -163,6 +175,26 @@ PYBIND11_MODULE(_native, m){
       .def(py::init<const unsigned int, const unsigned int, const bool, const bool>(), py::arg("entrySize"), py::arg("tupleSize"), py::arg("monoMapping") = false, py::arg("completeAddressing") = true)
       .def(py::init<const std::vector<int>, const unsigned int, const bool, const bool>(), py::arg("indexes"), py::arg("tupleSize"), py::arg("monoMapping") = false, py::arg("completeAddressing") = true)
       .def(py::init<const bool, const bool>(), py::arg("monoMapping") = false, py::arg("completeAddressing") = true)
+    ;
+
+    py::class_<Local2DMapping, MappingGenerator>(m, "Local2DMapping", py::module_local())
+      .def(py::init<unsigned int, unsigned int, unsigned int,
+                    unsigned int, unsigned int,
+                    unsigned int, unsigned int, unsigned int, bool>(),
+           py::arg("imageHeight"), py::arg("imageWidth"), py::arg("bitsPerPixel"),
+           py::arg("windowHeight"), py::arg("windowWidth"),
+           py::arg("tupleSize"),
+           py::arg("stride") = 0,
+           py::arg("ramsPerWindow") = 1,
+           py::arg("monoMapping") = false)
+      .def("getImageHeight",   &Local2DMapping::getImageHeight)
+      .def("getImageWidth",    &Local2DMapping::getImageWidth)
+      .def("getBitsPerPixel",  &Local2DMapping::getBitsPerPixel)
+      .def("getWindowHeight",  &Local2DMapping::getWindowHeight)
+      .def("getWindowWidth",   &Local2DMapping::getWindowWidth)
+      .def("getStride",        &Local2DMapping::getStride)
+      .def("getRamsPerWindow", &Local2DMapping::getRamsPerWindow)
+      .def("getNumberOfRAMs",  &Local2DMapping::getNumberOfRAMs)
     ;
 
     // regression mean functions

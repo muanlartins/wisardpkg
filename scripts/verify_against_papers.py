@@ -14,7 +14,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-CACHE = Path("/Users/muanlartins/repos/masters/notebooks/cache/section4_priorwisard_points.pkl")
+CACHE = Path("/Users/muanlartins/repos/masters/notebooks/f4rm/cache/section4_priorwisard_points.pkl")
 
 # DWN paper Table 5 — accuracy only (no model size given for tabular)
 DWN_TABLE5 = {

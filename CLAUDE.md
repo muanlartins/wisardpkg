@@ -2,7 +2,7 @@
 
 C++/Python library implementing the WiSARD (Wilkie, Stonham and Aleksander's Recognition Device) weightless neural network and its variants. Binary inputs are stored in RAM lookup tables — training is a write, inference is a read.
 
-This is a fork with several extensions on top of upstream `IAZero/wisardpkg`: `BloomWisard` and 4 new fitted thermometers (`Distributive`, `Gaussian`, `Exponential`, `Stochastic`) plus `SupervisedThermometer`, large-address RAMs (`addressSize > 64`), Wisard classification hooks (negative evidence, RAM weights, shared discriminator, attention weighting), multi-resolution mappings, and a `wisardpkg.models` Python subpackage with ports of three recent weightless architectures (BTHOWeN, DWN, ULEEN).
+This is a fork with several extensions on top of upstream `IAZero/wisardpkg`: `BloomWisard` and 4 new fitted thermometers (`Distributive`, `Gaussian`, `Exponential`, `Stochastic`) plus `SupervisedThermometer`, large-address RAMs (`addressSize > 64`), Wisard classification hooks (negative evidence, RAM weights, shared discriminator, attention weighting), multi-resolution mappings, `ColorMaskBinarization` (palette-targeted 3-bits-per-pixel encoder, originally for Where's Waldo), and a `wisardpkg.models` Python subpackage with ports of three recent weightless architectures (BTHOWeN, DWN, ULEEN).
 
 **Branch:** `muanlartins` (this fork's working branch); upstream `IAZero/wisardpkg` is on `develop`
 **Version:** 2.0.0a7
@@ -17,7 +17,7 @@ This is a fork with several extensions on top of upstream `IAZero/wisardpkg`: `B
 - [RAMs and Discriminators](claude-docs/rams-and-discriminators.md) — RAM nodes (standard ≤64 and large-address >64 paths), address computation, vote storage, Discriminator aggregation, per-RAM weights and pruning, RAMDataHandle, mental images
 
 ### Binarization (continuous → binary)
-- [Binarization](claude-docs/binarization.md) — All 10 techniques: Thresholding, MeanThresholding, SimpleThermometer, DynamicThermometer, DistributiveThermometer, GaussianThermometer, ExponentialThermometer, StochasticThermometer, SupervisedThermometer, KernelCanvas. Includes guidelines for choosing addressSize and thermoSize.
+- [Binarization](claude-docs/binarization.md) — All 11 techniques: Thresholding, MeanThresholding, SimpleThermometer, DynamicThermometer, DistributiveThermometer, GaussianThermometer, ExponentialThermometer, StochasticThermometer, SupervisedThermometer, KernelCanvas, ColorMaskBinarization. Includes guidelines for choosing addressSize and thermoSize.
 
 ### Classification
 - [Classification Models](claude-docs/classification-models.md) — Wisard (supervised, with optional negative-evidence / RAM-weighting / shared-discriminator / attention / soft-bleaching / cross-class hooks), ClusWisard (clustering: supervised/semi-supervised/unsupervised), BloomWisard (counting Bloom filters with `murmur` / `simhash` / `h3` hash modes, `getRawVotes` for custom bleaching)
@@ -65,7 +65,7 @@ vector<double> → [Binarization] → BinInput → [DataSet] → Model.train() �
 | ClusWiSARD model | `src/models/cluswisard/cluswisard.cc` |
 | BloomWiSARD model | `src/models/bloomwisard/` |
 | Regression model | `src/models/regressionwisard/regressionwisard.cc` |
-| Binarization | `src/binarization/` |
+| Binarization | `src/binarization/` (incl. `colormaskbinarization.cc`) |
 | Mapping | `src/mapping/` |
 | Python package | `wisardpkg/__init__.py`, `wisardpkg/models/{bthowen,dwn,uleen}.py` |
 | Sweep drivers | `scripts/sweeps/run_*.py`, `scripts/verify_against_papers.py` |
@@ -84,6 +84,7 @@ make clean                         # remove compiled .so files from test/
 ```
 
 ### Codebase Notes
+- `WisardWrapper(addressSize, mappingGenerator=...)` re-applies `setTupleSize(addressSize)` *after* kwargs processing — so a user-supplied mapping always picks up the Wisard's addressSize, even when the mapping was constructed without one. (Earlier versions silently lost the addressSize when a mapping was passed via kwargs and the user hadn't set tupleSize on the mapping themselves.)
 - All `.cc` files are `#include`'d into a single compilation unit via `wisardpkg.h` — they are not independently compiled
 - The C++ extension is built as `wisardpkg._native` (a submodule), and `wisardpkg/__init__.py` re-exports its symbols so `import wisardpkg as wp` is unchanged
 - PyBind11 wrappers in `src/wrappers/` handle `py::kwargs` → C++ member conversion

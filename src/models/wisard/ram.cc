@@ -189,6 +189,15 @@ public:
     return useLargeAddr ? largePositions.size() : positions.size();
   }
 
+  // Minimal deployed footprint of this RAM: the set of distinct seen addresses,
+  // each bit-packed as ceil(tupleSize/8) bytes (lossless, no false positives,
+  // unlike BloomWisard's fixed filter). The deployable analogue of the
+  // BTHOWeN/ULEEN/Bloom bit-table, on one comparable yardstick.
+  long deployedSizeBytes() const{
+    long bytesPerAddr = ((long)addresses.size() + 7) / 8;
+    return getNumEntries() * bytesPerAddr;
+  }
+
   ~RAM(){
     addresses.clear();
     positions.clear();

@@ -508,6 +508,14 @@ public:
     return size;
   }
 
+  long deployedSizeBytes() const override{
+    long size = 0;
+    for(auto& d: discriminators){
+      size += d.second.deployedSizeBytes();
+    }
+    return size;
+  }
+
 protected:
   void makeDiscriminator(std::string label, int entrySize){
     if (mappingGenerator->getEntrySize() < 2){

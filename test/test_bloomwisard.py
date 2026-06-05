@@ -103,6 +103,31 @@ class BloomWisardTestCase(TestCase):
         preds = bwsd.classify(self.X)
         self.assertEqual(len(preds), len(self.y))
 
+    def test_getsizeof_accounts_for_filters(self):
+        # Regression: getsizeof() must include the Bloom-filter storage, not just
+        # sizeof(BloomWisard). It previously returned a flat ~88 B (the model
+        # struct only), because BloomWisard::getsizeof did not traverse the
+        # discriminators/RAMs/filters. It must now scale with numBits.
+        small = wp.BloomWisard(addressSize=3, numBits=256, numHashes=2)
+        large = wp.BloomWisard(addressSize=3, numBits=4096, numHashes=2)
+        small.train(self.X)
+        large.train(self.X)
+        self.assertGreater(small.getsizeof(), 1000)  # far above the bare ~88 B object
+        self.assertGreater(large.getsizeof(), small.getsizeof())
+
+    def test_deployed_size_bytes(self):
+        # deployedSizeBytes() is the unified Pareto memory metric. For BloomWisard
+        # it is the deployed bit-table numRAMs*numBits/8 (fixed by config, not data).
+        bwsd = wp.BloomWisard(addressSize=3, numBits=1024, numHashes=2)
+        bwsd.train(self.X)
+        import math
+        expected = math.ceil(bwsd.getNumberOfRAMS() * bwsd.getNumBits() / 8)
+        self.assertEqual(bwsd.deployedSizeBytes(), expected)
+        # Larger filters -> larger deployed table.
+        big = wp.BloomWisard(addressSize=3, numBits=8192, numHashes=2)
+        big.train(self.X)
+        self.assertGreater(big.deployedSizeBytes(), bwsd.deployedSizeBytes())
+
 
 if __name__ == "__main__":
     main(verbosity=2)

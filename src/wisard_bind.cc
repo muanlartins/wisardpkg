@@ -133,6 +133,24 @@ PYBIND11_MODULE(_native, m){
       .def("setThresholds", &ExponentialThermometer::setThresholds)
     ;
 
+    py::class_<LogarithmicThermometer, BinBase>(m, "LogarithmicThermometer", py::module_local())
+      .def(py::init<const size_t>(), py::arg("thermometerSize") = 32)
+      .def("fit", &LogarithmicThermometer::fit)
+      .def("getSize", &LogarithmicThermometer::getSize)
+      .def("getThresholds", &LogarithmicThermometer::getThresholds)
+      .def("setThresholds", &LogarithmicThermometer::setThresholds)
+    ;
+
+    py::class_<CircularThermometer, BinBase>(m, "CircularThermometer", py::module_local())
+      .def(py::init<const size_t, const double, const double>(),
+           py::arg("thermometerSize") = 32,
+           py::arg("minimum") = 0.0,
+           py::arg("maximum") = 6.283185307179586)
+      .def("getSize", &CircularThermometer::getSize)
+      .def("getMinimum", &CircularThermometer::getMinimum)
+      .def("getMaximum", &CircularThermometer::getMaximum)
+    ;
+
     py::class_<SupervisedThermometer, BinBase>(m, "SupervisedThermometer", py::module_local())
       .def(py::init<const size_t, const std::string&, const size_t>(),
            py::arg("thermometerSize") = 32,
@@ -256,6 +274,7 @@ PYBIND11_MODULE(_native, m){
       .def("json", (std::string (Model::*)() const) &Model::json)
       .def("json", (std::string (Model::*)(std::string) const) &Model::json)
       .def("getsizeof", &Model::getsizeof)
+      .def("deployedSizeBytes", &Model::deployedSizeBytes)
     ;
 
     py::class_<ClassificationModel, Model>(m, "ClassificationModel", py::module_local())

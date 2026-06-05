@@ -147,6 +147,14 @@ public:
     return size;
   }
 
+  long deployedSizeBytes() const{
+    long size = 0;
+    for(unsigned int i=0; i<rams.size(); i++){
+      size += rams[i].deployedSizeBytes();
+    }
+    return size;
+  }
+
   std::vector<int> getTupleSizes() const{
     std::vector<int> sizes(rams.size());
     for(unsigned int i = 0; i < rams.size(); i++){

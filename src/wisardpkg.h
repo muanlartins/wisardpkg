@@ -44,6 +44,8 @@ namespace nl = nlohmann;
 #include "binarization/distributivethermometer.cc"
 #include "binarization/gaussianthermometer.cc"
 #include "binarization/exponentialthermometer.cc"
+#include "binarization/logarithmicthermometer.cc"
+#include "binarization/circularthermometer.cc"
 #include "binarization/supervisedthermometer.cc"
 #include "binarization/colormaskbinarization.cc"
 

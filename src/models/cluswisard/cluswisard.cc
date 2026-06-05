@@ -170,6 +170,14 @@ public:
     return size;
   }
 
+  long deployedSizeBytes() const override {
+    long size = unsupervisedCluster.deployedSizeBytes();
+    for (auto &i : clusters) {
+      size += i.second.deployedSizeBytes();
+    }
+    return size;
+  }
+
   ~ClusWisard() { clusters.clear(); }
 
   std::map<std::string, int> rank(const BinInput &image) const {

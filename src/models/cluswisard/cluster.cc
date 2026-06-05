@@ -153,6 +153,14 @@ public:
     return size;
   }
 
+  long deployedSizeBytes() const{
+    long size = 0;
+    for(auto& d: discriminators){
+      size += d.second->deployedSizeBytes();
+    }
+    return size;
+  }
+
   ~Cluster(){
     discriminators.clear();
   }

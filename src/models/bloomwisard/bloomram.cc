@@ -43,6 +43,15 @@ public:
 
   int getAddressSize() const { return (int)addresses.size(); }
 
+  // In-memory footprint in bytes: the tuple addresses plus the Bloom filter's
+  // heap (the filter struct itself is already inside sizeof(BloomRAM)).
+  long getsizeof() const {
+    long size = sizeof(BloomRAM);
+    size += (long)addresses.size() * sizeof(int);
+    size += filter.getsizeof() - (long)sizeof(BloomFilter);
+    return size;
+  }
+
 private:
   std::vector<int> getKey(const BinInput& image) const {
     std::vector<int> key(addresses.size());

@@ -73,6 +73,16 @@ public:
   int getNumBits() const { return numBits; }
   int getNumHashes() const { return numHashes; }
 
+  // In-memory footprint in bytes: the counting Bloom filter stores one int
+  // counter per position (counters), plus the H3 constant matrix when in h3 mode.
+  long getsizeof() const {
+    long size = sizeof(BloomFilter);
+    size += (long)counters.size() * sizeof(int);
+    size += (long)h3Constants.size() * sizeof(std::vector<uint64_t>);
+    for (const auto& row : h3Constants) size += (long)row.size() * sizeof(uint64_t);
+    return size;
+  }
+
 private:
   std::vector<int> computeHashes(const std::vector<int>& key) const {
     if (hashMode == "simhash") {

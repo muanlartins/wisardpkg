@@ -141,9 +141,23 @@ public:
     return config.dump();
   }
 
-  long getsizeof() const {
+  // In-memory footprint in bytes. Mirrors Wisard::getsizeof(): the model struct
+  // plus, per discriminator, the label string and the discriminator's full size
+  // (its BloomRAM nodes and their Bloom-filter counters). The previous version
+  // returned only sizeof(BloomWisard) (~88 B), ignoring all filter storage.
+  long getsizeof() const override {
     long size = sizeof(BloomWisard);
+    for (const auto& d : discriminators) {
+      size += (long)d.first.size() + d.second.getsizeof();
+    }
     return size;
+  }
+
+  // Deployed bit-table: numRAMs * numBits, 1 bit per filter position (the
+  // fixed-budget representation actually shipped). On the same yardstick as
+  // Wisard/ClusWisard::deployedSizeBytes() (their lossless seen-address set).
+  long deployedSizeBytes() const override {
+    return ((long)getNumberOfRAMS() * (long)getNumBits() + 7) / 8;
   }
 
   void setHashMode(const std::string& mode) {

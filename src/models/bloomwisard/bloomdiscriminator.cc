@@ -43,6 +43,15 @@ public:
   int getNumberOfRAMS() const { return (int)rams.size(); }
   int getNumberOfTrainings() const { return count; }
 
+  // In-memory footprint in bytes: the BloomRAM structs held in the rams vector
+  // plus each RAM's own heap (addresses + filter counters).
+  long getsizeof() const {
+    long size = sizeof(BloomDiscriminator);
+    size += (long)rams.size() * sizeof(BloomRAM);
+    for (const auto& r : rams) size += r.getsizeof() - (long)sizeof(BloomRAM);
+    return size;
+  }
+
 private:
   std::vector<BloomRAM> rams;
   int entrySize;

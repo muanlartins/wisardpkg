@@ -21,6 +21,7 @@ includes = [
 
     'mapping/mappinggenerator.cc',
     'mapping/randommapping.cc',
+    'mapping/local2dmapping.cc',
     'mapping/mappinggeneratorhelper.cc',
 
     'data/bininput.cc',
@@ -36,7 +37,10 @@ includes = [
     'binarization/distributivethermometer.cc',
     'binarization/gaussianthermometer.cc',
     'binarization/exponentialthermometer.cc',
-    'binarization/stochasticthermometer.cc',
+    'binarization/logarithmicthermometer.cc',
+    'binarization/circularthermometer.cc',
+    'binarization/supervisedthermometer.cc',
+    'binarization/colormaskbinarization.cc',
 
     'models/base/model.cc',
     'models/base/classificationmodel.cc',
@@ -47,6 +51,13 @@ includes = [
     'models/wisard/discriminator.cc',
     'models/wisard/wisard.cc',
 
+    'models/bloomwisard/murmur3.h',
+    'models/bloomwisard/lsh.h',
+    'models/bloomwisard/bloomfilter.cc',
+    'models/bloomwisard/bloomram.cc',
+    'models/bloomwisard/bloomdiscriminator.cc',
+    'models/bloomwisard/bloomwisard.cc',
+
     'models/cluswisard/cluster.cc',
     'models/cluswisard/cluswisard.cc',
 
@@ -56,6 +67,8 @@ includes = [
     'models/regressionwisard/regressionwisard.cc',
 
     'models/clusregressionwisard/clusregressionwisard.cc',
+
+    'binarization/stochasticthermometer.cc',
 ]
 
 if __name__ == "__main__":

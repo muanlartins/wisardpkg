@@ -8,7 +8,7 @@ works unchanged:
 
     >>> import wisardpkg as wp
     >>> clf = wp.Wisard(addressSize=4)            # C++ class, unchanged
-    >>> th = wp.GaussianThermometer(thermoSize=8) # C++ class, unchanged
+    >>> th = wp.GaussianThermometer(8)            # C++ class; ctor arg is thermometerSize
 
 The ``wisardpkg.models`` subpackage adds Python-side ports of three recent
 weightless architectures that build on top of the C++ core (or are pure

@@ -38,3 +38,9 @@ out = kc.transform(sequenceData)
 
 ```
 It will return the list of new input mapped from kernel. It will just zeros and ones of size numberOfKernels * bitsBykernel
+
+The first positional argument is `dim` (the per-time-step input dimensionality) — it
+is passed positionally, not as a keyword.
+
+For the full algorithm, the `useDirection` expansion, and all 13 binarization
+techniques, see [binarization](../../claude-docs/binarization.md#kernelcanvas).

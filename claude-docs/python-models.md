@@ -30,7 +30,7 @@ The C++ extension was renamed from a top-level `wisardpkg.so` to `wisardpkg/_nat
 ```python
 import wisardpkg as wp
 wp.Wisard(addressSize=4)             # C++ class, unchanged
-wp.GaussianThermometer(thermoSize=8) # C++ class, unchanged
+wp.GaussianThermometer(8)            # C++ class; ctor arg is thermometerSize (positional), src/wisard_bind.cc:121
 wp.BloomWisard(addressSize=8, numBits=1024, numHashes=3, hashMode="h3")
 ```
 

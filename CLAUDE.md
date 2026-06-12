@@ -4,7 +4,7 @@ C++/Python library implementing the WiSARD (Wilkie, Stonham and Aleksander's Rec
 
 This is a fork with several extensions on top of upstream `IAZero/wisardpkg`: `BloomWisard` and 4 new fitted thermometers (`Distributive`, `Gaussian`, `Exponential`, `Stochastic`) plus `SupervisedThermometer`, large-address RAMs (`addressSize > 64`), Wisard classification hooks (negative evidence, RAM weights, shared discriminator, attention weighting), multi-resolution mappings, `ColorMaskBinarization` (palette-targeted 3-bits-per-pixel encoder, originally for Where's Waldo), and a `wisardpkg.models` Python subpackage with ports of three recent weightless architectures (BTHOWeN, DWN, ULEEN).
 
-**Branch:** `muanlartins` (this fork's working branch); upstream `IAZero/wisardpkg` is on `develop`
+**Branch:** `main` (single canonical branch of this fork; see `CONTRIBUTING.md`); upstream `IAZero/wisardpkg` is on `develop`. The dedicated `performance` branch is the only long-lived exception, for the C++ reimplementation.
 **Version:** 2.0.0a7
 **Language:** C++ with PyBind11 Python bindings + Python package layer
 **Build:** `pip install .` (core) or `pip install ".[torch]"` (with DWN/ULEEN); also `make install`
@@ -17,7 +17,7 @@ This is a fork with several extensions on top of upstream `IAZero/wisardpkg`: `B
 - [RAMs and Discriminators](claude-docs/rams-and-discriminators.md) — RAM nodes (standard ≤64 and large-address >64 paths), address computation, vote storage, Discriminator aggregation, per-RAM weights and pruning, RAMDataHandle, mental images
 
 ### Binarization (continuous → binary)
-- [Binarization](claude-docs/binarization.md) — All 11 techniques: Thresholding, MeanThresholding, SimpleThermometer, DynamicThermometer, DistributiveThermometer, GaussianThermometer, ExponentialThermometer, StochasticThermometer, SupervisedThermometer, KernelCanvas, ColorMaskBinarization. Includes guidelines for choosing addressSize and thermoSize.
+- [Binarization](claude-docs/binarization.md) — All 13 techniques: Thresholding, MeanThresholding, SimpleThermometer, DynamicThermometer, CircularThermometer, DistributiveThermometer, GaussianThermometer, ExponentialThermometer, LogarithmicThermometer, StochasticThermometer, SupervisedThermometer, KernelCanvas, ColorMaskBinarization. Includes guidelines for choosing addressSize and thermometerSize.
 
 ### Classification
 - [Classification Models](claude-docs/classification-models.md) — Wisard (supervised, with optional negative-evidence / RAM-weighting / shared-discriminator / attention / soft-bleaching / cross-class hooks), ClusWisard (clustering: supervised/semi-supervised/unsupervised), BloomWisard (counting Bloom filters with `murmur` / `simhash` / `h3` hash modes, `getRawVotes` for custom bleaching)
@@ -33,6 +33,10 @@ This is a fork with several extensions on top of upstream `IAZero/wisardpkg`: `B
 
 ### Build and Testing
 - [Build and Testing](claude-docs/build-and-testing.md) — setup.py (with `[torch]` extra), Makefile, generate_include.py, C++ test list, Python-port test list, `scripts/sweeps/` reproducibility drivers, deployment
+
+### Performance / Benchmarking
+- [Performance Design](claude-docs/performance-design.md) — standalone optimized C++ standard-WiSARD reimplementation (the `performance` branch): bit-packed inputs, direct count-array / open-addressing RAM backends, bleaching parity, `deployedSizeBytes` yardstick, `wisard_bench` CLI + `*.wbin` shared format
+- [Benchmark Methodology](claude-docs/benchmark-methodology.md) — fair C++-vs-pybind11-vs-pure-Python comparison on MNIST: shared binarized+mapped artifact, accuracy gate before timing, metrics, hygiene, visualizers, MNIST acquisition
 
 ## Quick Reference
 

@@ -64,7 +64,7 @@ protected:
 
 **Source:** `src/mapping/randommapping.cc`
 
-The only mapping implementation. Generates random bit-to-RAM assignments.
+The default mapping. Generates random bit-to-RAM assignments. For spatially-structured inputs, see `Local2DMapping` below.
 
 ### Key Features
 
@@ -145,7 +145,7 @@ The flat bit vector is row-major over pixels, with the `bitsPerPixel` bits for e
 This matches:
 
 - `ColorMaskBinarization.transform(flatten(image_HWC))` — 3 bits per pixel.
-- Any per-channel thermometer applied to a flattened `(H, W, C)` array — set `bitsPerPixel = C * thermoSize`.
+- Any per-channel thermometer applied to a flattened `(H, W, C)` array — set `bitsPerPixel = C * thermometerSize`.
 
 ### Python API
 

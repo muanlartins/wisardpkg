@@ -17,3 +17,6 @@ This will return a synthetic data based on mentalImage.
 syntheticData = s.make()
 ```
 The return type will be a list of integers.
+
+For the `makeCube`/`make` internals, see
+[data-structures](../../claude-docs/data-structures.md#synthesizer).

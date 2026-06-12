@@ -48,7 +48,8 @@ d.train(X)
 ```
 
 ### classify
-Return the outputs of each RAM.
+Returns the vote of each RAM as a positional `list[int]` (one int per RAM, indexed
+by RAM number — not a dict).
 ```python
 x = [1,1,1,0,0,0,0,0]
 
@@ -71,3 +72,10 @@ This do the same as json() method, but without ram values.
 ```python
 print("Discriminator: ", d.jsonConfig())
 ```
+
+## Details and internals
+
+RAM initialization (`setRAMShuffle` / `setRAMByMapping`), per-RAM weights, mental
+images, and source `file:line`:
+[rams-and-discriminators](../../claude-docs/rams-and-discriminators.md#discriminator).
+

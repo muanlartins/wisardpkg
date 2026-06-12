@@ -367,3 +367,106 @@ This is what `wisardpkg.models.BTHOWeN` uses to drive its binary-search bleach t
 ### Trade-off
 
 BloomWisard's false-positive rate rises with fill ratio. Rough guide: for target FP rate `p`, pick `numBits ≈ -n · ln(p) / (ln 2)^2` where `n` is the expected number of distinct addresses per RAM. `numHashes ≈ (numBits / n) · ln 2` minimizes FPR at that capacity. The defaults (`numBits=1024, numHashes=3`) are a reasonable starting point for moderate datasets.
+
+---
+
+## Model lifecycle and inspection
+
+Beyond `train` / `classify` / `score`, every model exposes a small set of bound methods for incremental updates, in-place clearing, structure inspection, and memory accounting. These are defined on the model classes (not the wrappers) and reach Python through the `*Wrapper` inheritance chain — `WisardWrapper : Wisard`, `BloomWisardWrapper : BloomWisard`. The bindings live in `src/wisard_bind.cc`.
+
+### Memory accounting: `getsizeof` vs `deployedSizeBytes`
+
+**Bindings:** `src/wisard_bind.cc:276` (`getsizeof`), `src/wisard_bind.cc:277` (`deployedSizeBytes`) — both on the `Model` base, so every classification and regression model inherits them.
+
+The two methods answer different questions and the distinction is load-bearing for the F4RM paper's memory-accounting story:
+
+| Method | Question | Counts |
+|--------|----------|--------|
+| `getsizeof()` | How much RAM does this object occupy **in process right now**? | Every C++ struct, hash-map bucket, label string, weight vector, H3 constant matrix — full runtime overhead. |
+| `deployedSizeBytes()` | How small could the **learned model ship** for inference? | Only the minimal learned table / seen-set, bit-packed, on one yardstick comparable across model families. |
+
+`deployedSizeBytes()` is declared `virtual` on `Model` with a default of `return getsizeof()` (`src/models/base/model.cc:10`); the WiSARD families override it with their genuine deployable representation:
+
+| Model | `getsizeof()` | `deployedSizeBytes()` | Override |
+|-------|---------------|------------------------|----------|
+| `Wisard` | `sizeof(Wisard)` + per-discriminator (label string + `getsizeof`) | Σ over discriminators of Σ over RAMs of `numEntries × ceil(tupleSize/8)` — the **distinct seen addresses, bit-packed, lossless** | `src/models/wisard/wisard.cc:503`, `:511` |
+| `ClusWisard` | struct + unsupervised cluster + per-class clusters | Σ of every cluster's `deployedSizeBytes()` (each discriminator's lossless seen-set) | `src/models/cluswisard/cluswisard.cc:164`, `:173` |
+| `BloomWisard` | struct + per-discriminator (label + filters) | `ceil(numRAMs × numBits / 8)` — the **fixed-budget bit-table actually shipped** | `src/models/bloomwisard/bloomwisard.cc:148`, `:159` |
+| `RegressionWisard`, `ClusRegressionWisard` | struct + RAM contents | inherits the `Model` default — equals `getsizeof()` (no deployable override) | — |
+
+The per-RAM primitives that these roll up:
+
+- `RAM::getsizeof()` (`src/models/wisard/ram.cc:176`) — struct + address index (`int` per tuple bit) + the hash-map entries (`addr_t + content_t` each, or bit-packed key + `content_t` on the large-address path).
+- `RAM::deployedSizeBytes()` (`src/models/wisard/ram.cc:196`) — `getNumEntries() × ceil(tupleSize/8)`: just the set of distinct seen addresses, each packed to `ceil(tupleSize/8)` bytes. Lossless, no false positives — the deployable analogue of the BTHOWeN / ULEEN / Bloom bit-table, on the same scale.
+
+**Why the gap matters.** For an exact `Wisard`, `getsizeof()` includes `unordered_map` bucket overhead (typically ≥ 32 B per entry for an 8-byte key + 4-byte count), whereas `deployedSizeBytes()` charges only `ceil(tupleSize/8)` bytes per distinct address. For `BloomWisard`, `getsizeof()` grows with the in-memory `int` counter array (`numBits × 4` B per RAM) while `deployedSizeBytes()` charges **1 bit per filter slot** — the form an MCU would actually flash. Comparing models on `getsizeof()` penalises whichever has the heavier runtime container; comparing on `deployedSizeBytes()` is the apples-to-apples memory yardstick the paper reports.
+
+```python
+w = wp.Wisard(8); w.train(X, y)
+w.getsizeof()           # full in-RAM footprint (hash maps, strings, structs)
+w.deployedSizeBytes()   # bit-packed distinct-address set — what ships
+
+bw = wp.BloomWisard(8, numBits=1024, numHashes=3); bw.train(X, y)
+bw.getsizeof()          # struct + 4-byte counters per slot per RAM
+bw.deployedSizeBytes()  # ceil(numRAMs * 1024 / 8) — the 1-bit-per-slot table
+```
+
+### Incremental update and in-place clearing (`Wisard`)
+
+**Bindings:** `src/wisard_bind.cc:321` (`trainSingle`), `:322` (`untrainSingle`), `:323` (`reset`).
+
+| Method | Signature | Behaviour | Source |
+|--------|-----------|-----------|--------|
+| `trainSingle(input, label)` | `(BinInput, str) → None` | Trains one sample. Creates the discriminator for `label` on first sight (`makeDiscriminator`); also feeds the `__shared__` discriminator when `sharedDiscriminator=True`. | `src/models/wisard/wisard.cc:142` |
+| `untrainSingle(input, label)` | `(BinInput, str) → None` | Decrements the addresses this sample wrote into `label`'s discriminator. **No-op if `label` was never trained** (silent — guarded by a `find`). | `src/models/wisard/wisard.cc:157` |
+| `reset()` | `() → None` | Calls `Discriminator::reset()` on every discriminator: zeroes each `count` and clears every RAM's stored addresses. **Discriminators and their mappings survive** — the class set and bit-to-RAM assignment are preserved; only the learned contents are wiped. | `src/models/wisard/wisard.cc:136` |
+
+`trainSingle` / `untrainSingle` are the primitives behind `leaveOneOut` / `leaveMoreOut`; call them directly for online or streaming updates where rebuilding a `DataSet` per sample is wasteful. `reset()` lets you re-train a configured model (same `addressSize`, same hooks, same mapping) on fresh data without reconstructing it.
+
+```python
+w = wp.Wisard(4)
+w.trainSingle(wp.BinInput([1,0,1,0,1,0,1,0]), "hot")   # creates "hot" discriminator
+w.untrainSingle(wp.BinInput([1,0,1,0,1,0,1,0]), "hot") # rolls it back
+w.untrainSingle(some_input, "never_seen")              # silent no-op, not an error
+w.reset()                                              # wipe contents, keep structure
+```
+
+### Structure inspection: `getTupleSizes` (`Wisard`)
+
+**Binding:** `src/wisard_bind.cc:320`. Source: `src/models/wisard/wisard.cc:494`, delegating to `Discriminator::getTupleSizes()` (`src/models/wisard/discriminator.cc:158`).
+
+Returns `{label: [tupleSize_RAM0, tupleSize_RAM1, ...]}` — the bit-count each RAM reads, per discriminator. For a uniform `RandomMapping` every entry equals `addressSize`. Under **multi-resolution** mappings (`RandomMapping(tupleSizes=[...])`) or `Local2DMapping`, the per-RAM sizes vary, and `getTupleSizes()` is how you confirm the mapping was applied as intended. It is also the quantity that drives the multi-resolution vote reweight in `rank()` (each RAM's vote is scaled by its tuple size; see the hooks table above).
+
+```python
+w = wp.Wisard(3); w.train(X, y)
+w.getTupleSizes()        # {"cold": [3,3,3], "hot": [3,3,3]} for a uniform mapping
+```
+
+### Inspectors and reset (`BloomWisard`)
+
+**Bindings:** `src/wisard_bind.cc:334` (`reset`), `:339`–`:342` (the four inspectors).
+
+| Method | Returns | Meaning | Source |
+|--------|---------|---------|--------|
+| `getNumberOfRAMS()` | `int` | RAMs per discriminator (uniform after training). **Returns 0 before training** — discriminators are built lazily on first `train`. | `src/models/bloomwisard/bloomwisard.cc:117` |
+| `getNumBits()` | `int` | Bloom-filter slot count per RAM (the `numBits` ctor arg). | `src/models/bloomwisard/bloomwisard.cc:122` |
+| `getNumHashes()` | `int` | Hash functions per key (the `numHashes` ctor arg). | `src/models/bloomwisard/bloomwisard.cc:123` |
+| `getHashMode()` | `str` | `"murmur"`, `"simhash"`, or `"h3"`. | `src/models/bloomwisard/bloomwisard.cc:124` |
+| `reset()` | `None` | Calls `BloomDiscriminator::reset()` on each discriminator: zeroes `count` and clears every Bloom filter's counters (`std::fill(..., 0)`). Discriminators and mappings survive, exactly like `Wisard.reset()`. | `src/models/bloomwisard/bloomwisard.cc:126` |
+
+`getNumberOfRAMS() × getNumBits()` is precisely the bit count `deployedSizeBytes()` packs (`ceil(numRAMs × numBits / 8)`), so these inspectors let you reconstruct the deployed-size formula from Python without parsing JSON. Note the spelling: `BloomWisard.getNumberOfRAMS` (trailing capital S, matching the C++ method), versus `Local2DMapping.getNumberOfRAMs` (lowercase s) documented in `mapping.md`.
+
+```python
+bw = wp.BloomWisard(8, numBits=1024, numHashes=3, hashMode="h3")
+bw.getNumberOfRAMS()     # 0 — not trained yet
+bw.train(ds)
+bw.getNumberOfRAMS()     # e.g. 5
+bw.getNumBits()          # 1024
+bw.getHashMode()         # "h3"
+assert bw.deployedSizeBytes() == (bw.getNumberOfRAMS() * bw.getNumBits() + 7) // 8
+bw.reset()               # zero the filters, keep the configured structure
+```
+
+### Mapping inspection (`Local2DMapping`)
+
+`Local2DMapping` exposes its own getters — `getNumberOfRAMs()`, `getImageHeight/Width`, `getWindowHeight/Width`, `getBitsPerPixel`, `getStride`, `getRamsPerWindow` (bindings `src/wisard_bind.cc:208`–`:215`). These describe the *mapping* (RAM layout before training), not a trained model, so they live with the mapping reference. See `mapping.md` → "Local2DMapping" for the full table and the `getNumberOfRAMs()` formula.

@@ -61,3 +61,6 @@ modified_base64_data = ram_data.data()
 ### or just the base64 data of one ram
 modified_base64_data2 = ram_data.data(ram_index)
 ```
+
+For the storage format, `compare()`, and `RegressionRAMDataHandle`, see
+[data-structures](../../claude-docs/data-structures.md#ramdatahandle).

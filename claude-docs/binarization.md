@@ -2,11 +2,11 @@
 
 WiSARD operates on binary inputs. Binarization techniques convert real-valued (continuous) data into binary vectors suitable for the model. All binarizers inherit from `BinBase` and implement `transform()`.
 
-**Source files:** `src/binarization/` — `binbase.cc`, `thresholding.cc`, `meanthresholding.cc`, `thermometer.cc`, `distributivethermometer.cc`, `gaussianthermometer.cc`, `exponentialthermometer.cc`, `stochasticthermometer.cc`, `supervisedthermometer.cc`, `kernelcanvas.cc`
+**Source files:** `src/binarization/` — `binbase.cc`, `thresholding.cc`, `meanthresholding.cc`, `thermometer.cc`, `distributivethermometer.cc`, `gaussianthermometer.cc`, `exponentialthermometer.cc`, `logarithmicthermometer.cc`, `circularthermometer.cc`, `stochasticthermometer.cc`, `supervisedthermometer.cc`, `colormaskbinarization.cc`, `kernelcanvas.cc`
 
-There are three categories of thermometers:
-- **Static** (thresholds set at construction): SimpleThermometer, DynamicThermometer
-- **Fitted, unsupervised** (thresholds learned from data via `fit()`): Distributive, Gaussian, Exponential, Stochastic
+There are **13 techniques** bound to Python (all `BinBase` subclasses, `src/wisard_bind.cc:90–179`). The thermometers fall into three categories:
+- **Static** (thresholds set at construction): SimpleThermometer, DynamicThermometer, CircularThermometer (wrap-around, for periodic features)
+- **Fitted, unsupervised** (thresholds learned from data via `fit()`): Distributive, Gaussian, Exponential, Logarithmic, Stochastic
 - **Fitted, supervised** (thresholds learned from data + labels via `fit(X, y)`): Supervised (3 methods: class_conditional, mi_allocation, entropy_weighted)
 
 Plus one non-thermometer specialized encoder: **ColorMaskBinarization** for objects with a known small palette (see below).
@@ -129,9 +129,9 @@ Per-dimension variable thermometer encoding — each input dimension can have a 
 **Python API:**
 ```python
 binarizer = wp.DynamicThermometer(
-    sizes=[3, 5],          # 3 bits for dim 0, 5 bits for dim 1
-    minimum=[0.0, -1.0],   # per-dimension min
-    maximum=[1.0, 1.0]     # per-dimension max
+    thermometerSizes=[3, 5], # 3 bits for dim 0, 5 bits for dim 1
+    minimum=[0.0, -1.0],     # per-dimension min
+    maximum=[1.0, 1.0]       # per-dimension max
 )
 binary = binarizer.transform([0.5, 0.2])
 print(binarizer.getSize())  # 8 (3 + 5)
@@ -139,19 +139,19 @@ print(binarizer.getSize())  # 8 (3 + 5)
 
 **Algorithm:**
 Same as SimpleThermometer but with per-dimension threshold vectors:
-1. For each dimension `i`, generate `sizes[i]` thresholds in `[minimum[i], maximum[i]]`
+1. For each dimension `i`, generate `thermometerSizes[i]` thresholds in `[minimum[i], maximum[i]]`
 2. Each dimension independently encoded
-3. Output size = `sum(sizes)`
+3. Output size = `sum(thermometerSizes)`
 
 **Properties:**
 - Input/output ratio: varies per dimension
 - Flexible — different resolution per feature
-- Throws `Exception` if `minimum`/`maximum` vector sizes don't match `sizes`
+- Throws `Exception` if `minimum`/`maximum` vector sizes don't match `thermometerSizes`
 
-**Constructor parameters:**
+**Constructor parameters** (kwarg name `thermometerSizes`, `src/wisard_bind.cc:108`):
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `sizes` | `vector<size_t>` | required | Bits per dimension |
+| `thermometerSizes` | `vector<size_t>` | required | Bits per dimension |
 | `minimum` | `vector<double>` | `[]` (defaults to 0.0 each) | Per-dimension lower bound |
 | `maximum` | `vector<double>` | `[]` (defaults to 1.0 each) | Per-dimension upper bound |
 
@@ -310,6 +310,109 @@ binary = et.transform(sample.tolist())
 
 ---
 
+## LogarithmicThermometer
+
+Places per-feature thresholds **evenly in log-space** over each feature's observed `[min, max]` range, then maps them back to linear space. Resolution is dense at small magnitudes and sparse at large magnitudes — the opposite end of the range from how the value scales. Useful for positively-skewed or multiplicatively-scaled features (counts, prices, magnitudes) where small differences near zero matter more than the same absolute difference far out.
+
+Unlike Distributive/Gaussian/Exponential, it makes no distributional or percentile assumption beyond the observed extrema: only `min` and `max` per feature drive the thresholds.
+
+**Source:** `src/binarization/logarithmicthermometer.cc`
+**Binding:** `src/wisard_bind.cc:136` (`fit`, `getSize`, `getThresholds`, `setThresholds`)
+**Include order:** `src/wisardpkg.h:47`
+
+**Python API:**
+```python
+lt = wp.LogarithmicThermometer(32)
+lt.fit(X_train.tolist())              # learn per-feature log-spaced thresholds
+binary = lt.transform(sample.tolist())
+thresholds = lt.getThresholds()        # list of lists (n_features × thermo_size)
+lt.setThresholds(saved_thresholds)     # restore thresholds (also marks fitted=True)
+print(lt.getSize())                    # 32 (bits per feature)
+```
+
+**Algorithm** (`logarithmicthermometer.cc:5`):
+1. `fit(data)`: For each feature `f`, find `minv` and `maxv` across all samples.
+2. Compute a non-positive shift to keep the log finite: `shift = -minv + 1.0` if `minv <= 0`, else `0`. After shifting, the smallest value is `>= 1`.
+3. `logMin = log(minv + shift)`, `logMax = log(maxv + shift)`. If `logMax <= logMin` (constant feature), nudge `logMax = logMin + 1e-9`.
+4. Threshold `k` (for `k = 0 .. B-1`): `frac = (k+1)/(B+1)`; `logThr = logMin + frac*(logMax - logMin)`; store `valueRanges[f][k] = exp(logThr) - shift` (un-shifted back to original units).
+5. `transform()`: same strict `>` comparison as DistributiveThermometer, per-feature thresholds (`logarithmicthermometer.cc:41`). Output size = `input_size * thermometerSize`.
+
+**Properties:**
+- Per-feature thresholds — each feature's own `[min, max]` drives its log grid.
+- Thresholds are equally spaced in `log(value + shift)`, so successive thresholds grow geometrically in linear space. Fine resolution near `min`, coarse near `max`.
+- No distribution assumption — only the two extrema per feature are used (sensitive to outlier max).
+- Handles non-positive data via the shift; `min` and `max` mapping to a degenerate range is guarded.
+- `transform()` throws `Exception("LogarithmicThermometer must be fitted before transform!")` if called before `fit()` or `setThresholds()` (`logarithmicthermometer.cc:34`).
+
+**Constructor parameters:**
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `thermometerSize` | `size_t` | 32 | Number of bits per feature |
+
+**Distributive vs. Logarithmic:** both are fitted, unsupervised, per-feature, 1:N fixed expansion with identical `>`-comparison transforms. Distributive spaces thresholds by **empirical percentile** (equal data mass per region, robust to outliers); Logarithmic spaces them by **log-magnitude** over the raw extrema (geometric, ignores density, outlier-sensitive). Choose Logarithmic when the *scale* is what matters and the data spans orders of magnitude; choose Distributive when you want roughly equal counts per bin.
+
+---
+
+## CircularThermometer
+
+Static **wrap-around** thermometer for *periodic / angular* features — hour-of-day, day-of-week, compass heading, longitude, phase. Unlike the linear thermometers, `minimum` and `maximum` denote the **same point** on a circle, so values near each end of the range encode to similar bit patterns instead of opposite ones.
+
+Each of the `thermometerSize` bits owns a receptive field centred at an evenly-spaced point around the circle; a bit fires when the (wrapped) value lies within a quarter-period arc of its centre. The firing set is a contiguous arc that wraps across the `maximum`/`minimum` seam, so it behaves like a circular thermometer rather than a monotone fill.
+
+**Source:** `src/binarization/circularthermometer.cc`
+**Binding:** `src/wisard_bind.cc:144` (`getSize`, `getMinimum`, `getMaximum` — no `fit`)
+**Include order:** `src/wisardpkg.h:48`
+
+Static (no `fit()`): both `minimum` and `maximum` are constructor parameters, so it can `transform()` immediately. There is no `getThresholds()` / `setThresholds()` — bit centres are derived analytically, not stored.
+
+**Python API:**
+```python
+import wisardpkg as wp
+
+# hour-of-day on a 24h circle
+ct = wp.CircularThermometer(8, 0.0, 24.0)
+print(ct.getSize())     # 8  (bits per feature)
+print(ct.getMinimum())  # 0.0
+print(ct.getMaximum())  # 24.0
+
+binary = ct.transform([23.5, 0.5])
+# 23.5 and 0.5 are 1h apart on the circle → nearly identical bit patterns,
+# even though they sit at opposite ends of the linear [0,24) range.
+
+ct = wp.CircularThermometer(32)   # default range is one full turn: minimum=0.0, maximum=2*pi
+```
+
+**Algorithm** (`circularthermometer.cc:16`):
+
+Let `period = maximum - minimum`, `N = thermometerSize`. For each input feature value `x`:
+1. Shift and wrap into `[0, period)`: `v = (x - minimum) - floor((x - minimum)/period) * period` (`circularthermometer.cc:23`).
+2. For each bit `j` in `0..N-1`:
+   - centre `c_j = (j / N) * period` (`circularthermometer.cc:26`)
+   - circular distance `d = |v - c_j|`; if `d > period/2`, take the shortest arc `d = period - d` (`circularthermometer.cc:28`)
+   - bit `j = 1` if `d < period/4`, else `0` (`circularthermometer.cc:29`)
+3. Output size = `input_size * thermometerSize`.
+
+Because the activation window is a fixed quarter-period arc, every value fires the bits whose centres fall within `period/4` of it — about `N/2` bits — and that arc wraps seamlessly across the seam where `minimum` meets `maximum`.
+
+**Properties:**
+- Input/output ratio: 1:N (expands by `thermometerSize` factor), like SimpleThermometer.
+- Same encoding parameters for **all** input dimensions (one global range, not per-feature).
+- Wrap-around: distance respects the shortest arc, so `minimum ≡ maximum`. Use only for genuinely circular quantities; for ordinary magnitudes use [SimpleThermometer](#simplethermometer) or a fitted thermometer.
+- Roughly constant firing density (~half the bits set) regardless of value — carries *phase*, not magnitude.
+- Out-of-range inputs are wrapped, not clamped: a value `period` away encodes identically to the original.
+- Throws `Exception("CircularThermometer requires maximum > minimum")` if `period <= 0` (`circularthermometer.cc:11`).
+
+**Constructor parameters:**
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `thermometerSize` | `size_t` | 32 | Number of bits per input value |
+| `minimum` | `double` | 0.0 | Start of the period (identified with `maximum`) |
+| `maximum` | `double` | 6.283185307179586 (2π) | End of the period (identified with `minimum`) |
+
+**Accessors:** `getSize()` → bits per feature; `getMinimum()` / `getMaximum()` → the configured period bounds (`wisard_bind.cc:149`).
+
+---
+
 ## SupervisedThermometer
 
 Supervised binarization with **3 interchangeable methods** selected via the `method` parameter. All require labels during `fit()`.
@@ -457,7 +560,7 @@ print(bits.size())  # 3 bits per pixel
 
 ---
 
-## Choosing addressSize and thermoSize
+## Choosing addressSize and thermometerSize
 
 **addressSize** (bits per RAM) — controls pattern specificity:
 - Guideline: `addressSize ≤ log2(N_training_samples)`
@@ -465,12 +568,12 @@ print(bits.size())  # 3 bits per pixel
 - Too small → underfitting (too coarse)
 - Bleaching compensates for moderate overfitting
 
-**thermoSize** (bits per feature) — controls information richness:
+**thermometerSize** (bits per feature) — controls information richness:
 - More bits = finer value resolution, but larger binary input
 - Diminishing returns past ~8 bits for most datasets
-- Constraint: keep `n_features × thermoSize` under ~10,000 bits for reasonable speed
+- Constraint: keep `n_features × thermometerSize` under ~10,000 bits for reasonable speed
 
-| Dataset size | Suggested addressSize | Suggested thermoSize |
+| Dataset size | Suggested addressSize | Suggested thermometerSize |
 |-------------|----------------------|---------------------|
 | < 500 samples | 8-10 | 32 (if few features) |
 | 500-5,000 | 14-20 | 32 (if few features) |
@@ -490,6 +593,8 @@ print(bits.size())  # 3 bits per pixel
 | DistributiveThermometer | 1:N fixed | Yes (data) | Yes | General purpose, no distribution assumptions |
 | GaussianThermometer | 1:N fixed | Yes (data) | Yes | Roughly normal data |
 | ExponentialThermometer | 1:N fixed | Yes (data) | Yes | Right-skewed non-negative data |
+| LogarithmicThermometer | 1:N fixed | Yes (data) | Yes | Data spanning orders of magnitude; geometric resolution |
+| CircularThermometer | 1:N fixed | No | No (global) | Periodic / angular features (hour, heading, longitude); wrap-around |
 | SupervisedThermometer | 1:N fixed/variable | Yes (data + labels) | Yes | 3 methods: class-conditional, MI allocation, entropy-weighted |
 | StochasticThermometer | 1:N fixed | Yes + optimize() | Yes | Coordinate descent threshold optimization |
 | KernelCanvas | Sequence → fixed | No | N/A | Time-series, spatial sequences |

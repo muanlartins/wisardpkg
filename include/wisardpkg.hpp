@@ -24,6 +24,9 @@ https://github.com/IAZero/wisardpkg
 #include <cmath>
 #include <numeric> // std::accumulate
 #include <random>
+#include <thread>
+#include <mutex>
+#include <functional>
 /*
 JSON for Modern C++
 version 3.1.2
@@ -17320,6 +17323,8 @@ typedef char bin_t;
 // Classification
 typedef int content_t;
 typedef std::unordered_map<addr_t, content_t> ram_t;
+typedef std::string large_addr_t;
+typedef std::unordered_map<large_addr_t, content_t> large_ram_t;
 
 // Regression
 typedef std::vector<double> regression_content_t;
@@ -17858,6 +17863,7 @@ class MappingGenerator{
 public:
     bool completeAddressing;
     bool monoMapping;
+    bool multiResolution;
 
     virtual MappingGenerator* clone() const = 0;
     virtual std::vector<std::vector<int>> getMapping(const std::string label) = 0;
@@ -17943,7 +17949,7 @@ public:
     RandomMapping(const bool monoMapping=false, const bool completeAddressing=true) {
         init(std::vector<int>(), 0, monoMapping, completeAddressing);
     }
-    
+
     RandomMapping(const std::vector<int> indexes, const unsigned int tupleSize, const bool monoMapping=false, const bool completeAddressing=true) {
         init(indexes, tupleSize, monoMapping, completeAddressing);
     }
@@ -17981,7 +17987,7 @@ public:
         } else if (monoMapping && mapping.size() > 0){
             return mapping.begin()->second;
         }
-        
+
         mapping[label] = createMapping(tupleSize, indexes, completeAddressing);
         return mapping[label];
     }
@@ -18009,19 +18015,81 @@ protected:
     std::vector<std::vector<int>> createMapping(const unsigned int tupleSize, const std::vector<int>& indexes, const bool completeAddressing) const{
         std::vector<int> mappingIndexes = indexes;
 
+        std::random_device rd;
+        std::mt19937 mt(rd());
+
+        if (multiResolution) {
+            // Multi-Resolution: deterministic size distribution, random bit assignment.
+            // Same number of RAMs as standard. Sizes linearly spaced from min to max,
+            // then scaled so total = entrySize. Shuffled before assignment.
+            unsigned int entrySize = mappingIndexes.size();
+            unsigned int numRAMs = entrySize / tupleSize;
+            if (numRAMs == 0) numRAMs = 1;
+            if (entrySize % tupleSize != 0 && completeAddressing) numRAMs++;
+
+            unsigned int minSize = std::max((unsigned int)2, tupleSize / 2);
+            unsigned int maxSize = tupleSize * 3 / 2;
+            if (maxSize < minSize) maxSize = minSize;
+
+            // Generate linearly spaced sizes
+            std::vector<unsigned int> sizes(numRAMs);
+            if (numRAMs == 1) {
+                sizes[0] = entrySize;
+            } else {
+                for (unsigned int i = 0; i < numRAMs; i++) {
+                    double frac = (double)i / (double)(numRAMs - 1);
+                    sizes[i] = (unsigned int)(minSize + frac * (maxSize - minSize) + 0.5);
+                }
+            }
+
+            // Scale to exactly cover entrySize bits
+            unsigned int currentTotal = 0;
+            for (unsigned int i = 0; i < numRAMs; i++) currentTotal += sizes[i];
+
+            // Distribute surplus/deficit across RAMs
+            int delta = (int)entrySize - (int)currentTotal;
+            while (delta > 0) {
+                for (unsigned int i = numRAMs; i > 0 && delta > 0; i--) {
+                    sizes[i-1]++; delta--;
+                }
+            }
+            while (delta < 0) {
+                for (unsigned int i = 0; i < numRAMs && delta < 0; i++) {
+                    if (sizes[i] > 2) { sizes[i]--; delta++; }
+                }
+            }
+
+            // Shuffle sizes so position doesn't determine size
+            std::shuffle(sizes.begin(), sizes.end(), mt);
+
+            // Shuffle input bits then assign variable-size chunks
+            std::shuffle(mappingIndexes.begin(), mappingIndexes.end(), mt);
+
+            std::vector<std::vector<int>> result;
+            unsigned int pos = 0;
+            for (unsigned int i = 0; i < numRAMs && pos < entrySize; i++) {
+                unsigned int sz = sizes[i];
+                if (pos + sz > entrySize) sz = entrySize - pos;
+                result.push_back(std::vector<int>(
+                    mappingIndexes.begin() + pos,
+                    mappingIndexes.begin() + pos + sz));
+                pos += sz;
+            }
+            return result;
+        }
+
+        // Standard: uniform-size chunks
         if (completeAddressing){
             mappingIndexes = completeMapping(tupleSize, mappingIndexes);
         }
 
-        std::random_device rd;
-        std::mt19937 mt(rd());
         std::shuffle(mappingIndexes.begin(), mappingIndexes.end(), mt);
-                
+
         unsigned int numberOfRAMS = mappingIndexes.size() / tupleSize;
         std::vector<std::vector<int>> mapping(numberOfRAMS);
 
         for(unsigned int i = 0; i < numberOfRAMS; i++){
-            mapping[i] = std::vector<int>(mappingIndexes.begin() + (i*tupleSize), mappingIndexes.begin() + ((i+1)*tupleSize)); 
+            mapping[i] = std::vector<int>(mappingIndexes.begin() + (i*tupleSize), mappingIndexes.begin() + ((i+1)*tupleSize));
         }
 
         return mapping;
@@ -18030,9 +18098,172 @@ protected:
     void init(const std::vector<int> indexes, const unsigned int tupleSize, const bool monoMapping, const bool completeAddressing){
         this->indexes = indexes;
         this->tupleSize = tupleSize;
-        this->monoMapping = monoMapping; 
+        this->monoMapping = monoMapping;
         this->completeAddressing = completeAddressing;
+        this->multiResolution = false;
     }
+};
+// Spatially-aware mapping for image-like inputs.
+//
+// Standard RandomMapping shuffles all input bits uniformly across RAMs. For
+// image data, that destroys the 2D co-occurrence that makes structural patterns
+// (stripes, edges, blob configurations) detectable. Local2DMapping confines each
+// RAM's input bits to a contiguous (windowHeight × windowWidth × bitsPerPixel)
+// window of the image, with the windows tiled across the image with optional
+// overlap.
+//
+// Input layout assumption: the flat bit vector is row-major over pixels, with
+// the `bitsPerPixel` bits for each pixel contiguous. That is, the bit at
+// (row=h, col=w, bit=k) lives at index  h*W*bitsPerPixel + w*bitsPerPixel + k,
+// for 0 <= h < imageHeight, 0 <= w < imageWidth, 0 <= k < bitsPerPixel.
+// This matches what you get by flattening an (H, W, C) uint8 array per pixel
+// after a per-pixel binariser like ColorMaskBinarization, or an (H, W, C*B)
+// array after per-channel thermometer encoding (set bitsPerPixel = C * B).
+class Local2DMapping : public MappingGenerator {
+private:
+  unsigned int imageHeight;
+  unsigned int imageWidth;
+  unsigned int bitsPerPixel;
+  unsigned int windowHeight;
+  unsigned int windowWidth;
+  unsigned int stride;          // 0 means stride = window size (no overlap)
+  unsigned int ramsPerWindow;   // number of RAMs sampled from each window
+
+public:
+  Local2DMapping(unsigned int imageHeight,
+                 unsigned int imageWidth,
+                 unsigned int bitsPerPixel,
+                 unsigned int windowHeight,
+                 unsigned int windowWidth,
+                 unsigned int tupleSize,
+                 unsigned int stride = 0,
+                 unsigned int ramsPerWindow = 1,
+                 bool monoMapping = false) {
+    if (imageHeight < 1 || imageWidth < 1 || bitsPerPixel < 1)
+      throw Exception("Local2DMapping: image dimensions and bitsPerPixel must be >= 1");
+    if (windowHeight < 1 || windowWidth < 1)
+      throw Exception("Local2DMapping: window dimensions must be >= 1");
+    if (windowHeight > imageHeight || windowWidth > imageWidth)
+      throw Exception("Local2DMapping: window must fit inside image");
+    unsigned int bitsPerWindow = windowHeight * windowWidth * bitsPerPixel;
+    if (tupleSize < 2)
+      throw Exception("Local2DMapping: tupleSize must be >= 2");
+    if (tupleSize > bitsPerWindow)
+      throw Exception("Local2DMapping: tupleSize must not exceed bits in a window");
+    if (ramsPerWindow < 1)
+      throw Exception("Local2DMapping: ramsPerWindow must be >= 1");
+
+    this->imageHeight   = imageHeight;
+    this->imageWidth    = imageWidth;
+    this->bitsPerPixel  = bitsPerPixel;
+    this->windowHeight  = windowHeight;
+    this->windowWidth   = windowWidth;
+    this->stride        = stride == 0 ? std::min(windowHeight, windowWidth) : stride;
+    this->ramsPerWindow = ramsPerWindow;
+    this->tupleSize     = tupleSize;
+    this->monoMapping   = monoMapping;
+    this->completeAddressing = false;  // we always emit fixed tupleSize, no padding semantics
+    this->multiResolution    = false;
+
+    // Pre-fill `indexes` so getEntrySize()/checkEntrySize work consistently.
+    unsigned int entrySize = imageHeight * imageWidth * bitsPerPixel;
+    this->indexes = entrySizeToIndexes(entrySize);
+  }
+
+  Local2DMapping(nl::json config) {
+    imageHeight   = config["imageHeight"].get<unsigned int>();
+    imageWidth    = config["imageWidth"].get<unsigned int>();
+    bitsPerPixel  = config["bitsPerPixel"].get<unsigned int>();
+    windowHeight  = config["windowHeight"].get<unsigned int>();
+    windowWidth   = config["windowWidth"].get<unsigned int>();
+    stride        = config["stride"].get<unsigned int>();
+    ramsPerWindow = config["ramsPerWindow"].get<unsigned int>();
+    tupleSize     = config["tupleSize"].get<unsigned int>();
+    monoMapping   = config["monoMapping"].get<bool>();
+    completeAddressing = false;
+    multiResolution    = false;
+    auto m_it = config.find("mapping");
+    if (m_it != config.end()) {
+      mapping = m_it->get<std::map<std::string, std::vector<std::vector<int>>>>();
+    }
+    indexes = entrySizeToIndexes(imageHeight * imageWidth * bitsPerPixel);
+  }
+
+  std::vector<std::vector<int>> getMapping(const std::string label) override {
+    auto it = mapping.find(label);
+    if (it != mapping.end()) return it->second;
+    if (monoMapping && !mapping.empty()) return mapping.begin()->second;
+
+    std::random_device rd;
+    std::mt19937 mt(rd());
+
+    std::vector<std::vector<int>> result;
+    std::vector<int> windowBits(windowHeight * windowWidth * bitsPerPixel);
+
+    for (unsigned int top = 0; top + windowHeight <= imageHeight; top += stride) {
+      for (unsigned int left = 0; left + windowWidth <= imageWidth; left += stride) {
+        // Collect the absolute bit indices that live in this window.
+        unsigned int p = 0;
+        for (unsigned int dh = 0; dh < windowHeight; dh++) {
+          for (unsigned int dw = 0; dw < windowWidth; dw++) {
+            unsigned int pixelBase = ((top + dh) * imageWidth + (left + dw)) * bitsPerPixel;
+            for (unsigned int k = 0; k < bitsPerPixel; k++) {
+              windowBits[p++] = (int)(pixelBase + k);
+            }
+          }
+        }
+
+        // Emit ramsPerWindow RAMs, each a random tupleSize-sized subset of windowBits.
+        for (unsigned int r = 0; r < ramsPerWindow; r++) {
+          std::shuffle(windowBits.begin(), windowBits.end(), mt);
+          result.emplace_back(windowBits.begin(), windowBits.begin() + tupleSize);
+        }
+      }
+    }
+
+    mapping[label] = result;
+    return result;
+  }
+
+  MappingGenerator* clone() const override {
+    return new Local2DMapping(imageHeight, imageWidth, bitsPerPixel,
+                              windowHeight, windowWidth, tupleSize,
+                              stride, ramsPerWindow, monoMapping);
+  }
+
+  std::string json() const override {
+    nl::json config = {
+      {"imageHeight",   imageHeight},
+      {"imageWidth",    imageWidth},
+      {"bitsPerPixel",  bitsPerPixel},
+      {"windowHeight",  windowHeight},
+      {"windowWidth",   windowWidth},
+      {"stride",        stride},
+      {"ramsPerWindow", ramsPerWindow},
+      {"tupleSize",     tupleSize},
+      {"monoMapping",   monoMapping},
+      {"mapping",       mapping},
+    };
+    return config.dump();
+  }
+
+  std::string className() const override {
+    return "Local2DMapping";
+  }
+
+  // Accessors (helpful from Python for diagnostics).
+  unsigned int getImageHeight()   const { return imageHeight; }
+  unsigned int getImageWidth()    const { return imageWidth; }
+  unsigned int getBitsPerPixel()  const { return bitsPerPixel; }
+  unsigned int getWindowHeight() const { return windowHeight; }
+  unsigned int getWindowWidth()  const { return windowWidth; }
+  unsigned int getStride()        const { return stride; }
+  unsigned int getRamsPerWindow() const { return ramsPerWindow; }
+  unsigned int getNumberOfRAMs()  const {
+    unsigned int rowsOfWindows = ((imageHeight - windowHeight) / stride) + 1;
+    unsigned int colsOfWindows = ((imageWidth  - windowWidth ) / stride) + 1;
+    return rowsOfWindows * colsOfWindows * ramsPerWindow;
+  }
 };
 class MappingGeneratorHelper {
 public:
@@ -18052,6 +18283,11 @@ public:
     if(className.compare("RandomMapping")==0){
       nl::json params = config[MappingGeneratorHelper::params];
       return new RandomMapping(params);
+    }
+
+    if(className.compare("Local2DMapping")==0){
+      nl::json params = config[MappingGeneratorHelper::params];
+      return new Local2DMapping(params);
     }
 
     return new RandomMapping();
@@ -18992,12 +19228,784 @@ protected:
   std::vector<std::vector<double>> valueRanges;
 };
 
+class DistributiveThermometer : public BinBase {
+public:
+  DistributiveThermometer(const size_t thermometerSize) : thermometerSize(thermometerSize), fitted(false) {}
+
+  void fit(const std::vector<std::vector<double>>& data) {
+    if (data.empty()) return;
+    size_t n_samples = data.size();
+    size_t n_features = data[0].size();
+
+    valueRanges.resize(n_features);
+
+    for (size_t f = 0; f < n_features; f++) {
+      std::vector<double> values(n_samples);
+      for (size_t i = 0; i < n_samples; i++) {
+        values[i] = data[i][f];
+      }
+      std::sort(values.begin(), values.end());
+
+      // B bits → B+1 equal-probability regions → thresholds at percentile k/(B+1)
+      valueRanges[f].resize(thermometerSize);
+      for (size_t k = 0; k < thermometerSize; k++) {
+        double percentile = (double)(k + 1) / (double)(thermometerSize + 1);
+        size_t index = (size_t)(percentile * (double)(n_samples - 1));
+        if (index >= n_samples) index = n_samples - 1;
+        valueRanges[f][k] = values[index];
+      }
+    }
+
+    fitted = true;
+  }
+
+  BinInput transform(const std::vector<double>& data) {
+    if (!fitted) {
+      throw Exception("DistributiveThermometer must be fitted before transform!");
+    }
+
+    BinInput out(data.size() * thermometerSize);
+    size_t k = 0;
+    for (size_t i = 0; i < data.size(); i++) {
+      for (size_t j = 0; j < valueRanges[i].size(); j++) {
+        if (data[i] > valueRanges[i][j]) {
+          out.set(k, 1);
+        } else {
+          out.set(k, 0);
+        }
+        k++;
+      }
+    }
+    return out;
+  }
+
+  size_t getSize() const {
+    return thermometerSize;
+  }
+
+  std::vector<std::vector<double>> getThresholds() const {
+    return valueRanges;
+  }
+
+  void setThresholds(const std::vector<std::vector<double>>& thresholds) {
+    valueRanges = thresholds;
+    fitted = true;
+  }
+
+protected:
+  size_t thermometerSize;
+  std::vector<std::vector<double>> valueRanges;
+  bool fitted;
+};
+class GaussianThermometer : public BinBase {
+public:
+  GaussianThermometer(const size_t thermometerSize) : thermometerSize(thermometerSize), fitted(false) {}
+
+  void fit(const std::vector<std::vector<double>>& data) {
+    if (data.empty()) return;
+    size_t n_samples = data.size();
+    size_t n_features = data[0].size();
+
+    valueRanges.resize(n_features);
+
+    for (size_t f = 0; f < n_features; f++) {
+      std::vector<double> values(n_samples);
+      for (size_t i = 0; i < n_samples; i++) {
+        values[i] = data[i][f];
+      }
+
+      double mu = math::mean(values);
+      double sigma = (n_samples > 1) ? math::stdev(values) : 0.0;
+
+      valueRanges[f].resize(thermometerSize);
+      for (size_t k = 0; k < thermometerSize; k++) {
+        double p = (double)(k + 1) / (double)(thermometerSize + 1);
+        if (sigma > 0.0) {
+          valueRanges[f][k] = mu + sigma * probit(p);
+        } else {
+          valueRanges[f][k] = mu;
+        }
+      }
+    }
+
+    fitted = true;
+  }
+
+  BinInput transform(const std::vector<double>& data) {
+    if (!fitted) {
+      throw Exception("GaussianThermometer must be fitted before transform!");
+    }
+
+    BinInput out(data.size() * thermometerSize);
+    size_t k = 0;
+    for (size_t i = 0; i < data.size(); i++) {
+      for (size_t j = 0; j < valueRanges[i].size(); j++) {
+        if (data[i] > valueRanges[i][j]) {
+          out.set(k, 1);
+        } else {
+          out.set(k, 0);
+        }
+        k++;
+      }
+    }
+    return out;
+  }
+
+  size_t getSize() const {
+    return thermometerSize;
+  }
+
+  std::vector<std::vector<double>> getThresholds() const {
+    return valueRanges;
+  }
+
+  void setThresholds(const std::vector<std::vector<double>>& thresholds) {
+    valueRanges = thresholds;
+    fitted = true;
+  }
+
+private:
+  // Peter Acklam's rational approximation for the inverse normal CDF (probit)
+  // Accurate to approximately 1.15e-9 across the full range (0, 1)
+  static double probit(double p) {
+    static const double a[] = {
+      -3.969683028665376e+01,  2.209460984245205e+02,
+      -2.759285104469687e+02,  1.383577518672690e+02,
+      -3.066479806614716e+01,  2.506628277459239e+00
+    };
+    static const double b[] = {
+      -5.447609879822406e+01,  1.615858368580409e+02,
+      -1.556989798598866e+02,  6.680131188771972e+01,
+      -1.328068155288572e+01
+    };
+    static const double c[] = {
+      -7.784894002430293e-03, -3.223964580411365e-01,
+      -2.400758277161838e+00, -2.549732539343734e+00,
+       4.374664141464968e+00,  2.938163982698783e+00
+    };
+    static const double d[] = {
+       7.784695709041462e-03,  3.224671290700398e-01,
+       2.445134137142996e+00,  3.754408661907416e+00
+    };
+
+    static const double p_low  = 0.02425;
+    static const double p_high = 1.0 - p_low;
+
+    double q, r;
+
+    if (p < p_low) {
+      // Lower tail
+      q = std::sqrt(-2.0 * std::log(p));
+      return (((((c[0]*q+c[1])*q+c[2])*q+c[3])*q+c[4])*q+c[5]) /
+              ((((d[0]*q+d[1])*q+d[2])*q+d[3])*q+1.0);
+    } else if (p <= p_high) {
+      // Central region
+      q = p - 0.5;
+      r = q * q;
+      return (((((a[0]*r+a[1])*r+a[2])*r+a[3])*r+a[4])*r+a[5])*q /
+             (((((b[0]*r+b[1])*r+b[2])*r+b[3])*r+b[4])*r+1.0);
+    } else {
+      // Upper tail (symmetry)
+      q = std::sqrt(-2.0 * std::log(1.0 - p));
+      return -(((((c[0]*q+c[1])*q+c[2])*q+c[3])*q+c[4])*q+c[5]) /
+               ((((d[0]*q+d[1])*q+d[2])*q+d[3])*q+1.0);
+    }
+  }
+
+protected:
+  size_t thermometerSize;
+  std::vector<std::vector<double>> valueRanges;
+  bool fitted;
+};
+class ExponentialThermometer : public BinBase {
+public:
+  ExponentialThermometer(const size_t thermometerSize) : thermometerSize(thermometerSize), fitted(false) {}
+
+  void fit(const std::vector<std::vector<double>>& data) {
+    if (data.empty()) return;
+    size_t n_samples = data.size();
+    size_t n_features = data[0].size();
+
+    valueRanges.resize(n_features);
+
+    for (size_t f = 0; f < n_features; f++) {
+      std::vector<double> values(n_samples);
+      for (size_t i = 0; i < n_samples; i++) {
+        values[i] = data[i][f];
+      }
+
+      double mu = math::mean(values);
+
+      valueRanges[f].resize(thermometerSize);
+      for (size_t k = 0; k < thermometerSize; k++) {
+        double p = (double)(k + 1) / (double)(thermometerSize + 1);
+        if (mu > 0.0) {
+          // Inverse CDF of exponential: F^{-1}(p) = -ln(1-p) / lambda = -ln(1-p) * mu
+          valueRanges[f][k] = -std::log(1.0 - p) * mu;
+        } else {
+          valueRanges[f][k] = 0.0;
+        }
+      }
+    }
+
+    fitted = true;
+  }
+
+  BinInput transform(const std::vector<double>& data) {
+    if (!fitted) {
+      throw Exception("ExponentialThermometer must be fitted before transform!");
+    }
+
+    BinInput out(data.size() * thermometerSize);
+    size_t k = 0;
+    for (size_t i = 0; i < data.size(); i++) {
+      for (size_t j = 0; j < valueRanges[i].size(); j++) {
+        if (data[i] > valueRanges[i][j]) {
+          out.set(k, 1);
+        } else {
+          out.set(k, 0);
+        }
+        k++;
+      }
+    }
+    return out;
+  }
+
+  size_t getSize() const {
+    return thermometerSize;
+  }
+
+  std::vector<std::vector<double>> getThresholds() const {
+    return valueRanges;
+  }
+
+  void setThresholds(const std::vector<std::vector<double>>& thresholds) {
+    valueRanges = thresholds;
+    fitted = true;
+  }
+
+protected:
+  size_t thermometerSize;
+  std::vector<std::vector<double>> valueRanges;
+  bool fitted;
+};
+class LogarithmicThermometer : public BinBase {
+public:
+  LogarithmicThermometer(const size_t thermometerSize) : thermometerSize(thermometerSize), fitted(false) {}
+
+  void fit(const std::vector<std::vector<double>>& data) {
+    if (data.empty()) return;
+    size_t n_samples = data.size();
+    size_t n_features = data[0].size();
+
+    valueRanges.resize(n_features);
+
+    for (size_t f = 0; f < n_features; f++) {
+      double minv = data[0][f], maxv = data[0][f];
+      for (size_t i = 1; i < n_samples; i++) {
+        if (data[i][f] < minv) minv = data[i][f];
+        if (data[i][f] > maxv) maxv = data[i][f];
+      }
+      double shift = (minv <= 0.0) ? (-minv + 1.0) : 0.0;
+      double logMin = std::log(minv + shift);
+      double logMax = std::log(maxv + shift);
+      if (logMax <= logMin) logMax = logMin + 1e-9;
+
+      valueRanges[f].resize(thermometerSize);
+      for (size_t k = 0; k < thermometerSize; k++) {
+        double frac = (double)(k + 1) / (double)(thermometerSize + 1);
+        double logThr = logMin + frac * (logMax - logMin);
+        valueRanges[f][k] = std::exp(logThr) - shift;
+      }
+    }
+    fitted = true;
+  }
+
+  BinInput transform(const std::vector<double>& data) {
+    if (!fitted) {
+      throw Exception("LogarithmicThermometer must be fitted before transform!");
+    }
+    BinInput out(data.size() * thermometerSize);
+    size_t k = 0;
+    for (size_t i = 0; i < data.size(); i++) {
+      for (size_t j = 0; j < valueRanges[i].size(); j++) {
+        if (data[i] > valueRanges[i][j]) {
+          out.set(k, 1);
+        } else {
+          out.set(k, 0);
+        }
+        k++;
+      }
+    }
+    return out;
+  }
+
+  size_t getSize() const {
+    return thermometerSize;
+  }
+
+  std::vector<std::vector<double>> getThresholds() const {
+    return valueRanges;
+  }
+
+  void setThresholds(const std::vector<std::vector<double>>& thresholds) {
+    valueRanges = thresholds;
+    fitted = true;
+  }
+
+protected:
+  size_t thermometerSize;
+  std::vector<std::vector<double>> valueRanges;
+  bool fitted;
+};
+// CircularThermometer — for periodic values (lat/lon, hour, day-of-week).
+// Each bit_i has a receptive field centered at c_i = (i/N) * period, of width period/2.
+// Bit fires when the value lies within the circular-distance window of the center.
+class CircularThermometer : public BinBase {
+public:
+  CircularThermometer(const size_t thermometerSize,
+                      const double minimum = 0.0,
+                      const double maximum = 6.283185307179586)
+    : thermometerSize(thermometerSize), minv(minimum), maxv(maximum) {
+    period = maximum - minimum;
+    if (period <= 0.0) {
+      throw Exception("CircularThermometer requires maximum > minimum");
+    }
+  }
+
+  BinInput transform(const std::vector<double>& data) {
+    BinInput out(data.size() * thermometerSize);
+    size_t k = 0;
+    double halfPeriod = period / 2.0;
+    double quarterPeriod = period / 4.0;
+    for (size_t i = 0; i < data.size(); i++) {
+      // wrap value into [0, period)
+      double v = data[i] - minv;
+      v = v - std::floor(v / period) * period;
+      for (size_t j = 0; j < thermometerSize; j++) {
+        double center = ((double)j / (double)thermometerSize) * period;
+        double diff = std::fabs(v - center);
+        if (diff > halfPeriod) diff = period - diff;  // shortest arc
+        out.set(k, diff < quarterPeriod ? 1 : 0);
+        k++;
+      }
+    }
+    return out;
+  }
+
+  size_t getSize() const {
+    return thermometerSize;
+  }
+
+  double getMinimum() const { return minv; }
+  double getMaximum() const { return maxv; }
+
+protected:
+  size_t thermometerSize;
+  double minv;
+  double maxv;
+  double period;
+};
+class SupervisedThermometer : public BinBase {
+public:
+  SupervisedThermometer(
+    const size_t thermometerSize = 32,
+    const std::string& method = "class_conditional",
+    const size_t minBitsPerFeature = 2
+  ) : thermometerSize(thermometerSize), method(method),
+      minBitsPerFeature(minBitsPerFeature), totalSize(0), fitted(false) {}
+
+  void fit(
+    const std::vector<std::vector<double>>& data,
+    const std::vector<std::string>& labels
+  ) {
+    if (data.empty()) return;
+    size_t n_samples = data.size();
+    size_t n_features = data[0].size();
+
+    if (method == "mi_allocation") {
+      fitMIAllocation(data, labels, n_samples, n_features);
+    } else if (method == "entropy_weighted") {
+      fitEntropyWeighted(data, labels, n_samples, n_features);
+    } else {
+      fitClassConditional(data, labels, n_samples, n_features);
+    }
+
+    totalSize = 0;
+    for (size_t f = 0; f < valueRanges.size(); f++) {
+      totalSize += valueRanges[f].size();
+    }
+    fitted = true;
+  }
+
+  BinInput transform(const std::vector<double>& data) {
+    if (!fitted) {
+      throw Exception("SupervisedThermometer must be fitted before transform!");
+    }
+
+    BinInput out(totalSize);
+    size_t k = 0;
+    for (size_t i = 0; i < data.size(); i++) {
+      for (size_t j = 0; j < valueRanges[i].size(); j++) {
+        if (data[i] > valueRanges[i][j]) {
+          out.set(k, 1);
+        } else {
+          out.set(k, 0);
+        }
+        k++;
+      }
+    }
+    return out;
+  }
+
+  size_t getSize() const {
+    return totalSize > 0 ? totalSize : thermometerSize;
+  }
+
+  std::vector<size_t> getSizes() const {
+    return featureSizes;
+  }
+
+  std::vector<std::vector<double>> getThresholds() const {
+    return valueRanges;
+  }
+
+  void setThresholds(const std::vector<std::vector<double>>& thresholds) {
+    valueRanges = thresholds;
+    featureSizes.resize(thresholds.size());
+    totalSize = 0;
+    for (size_t i = 0; i < thresholds.size(); i++) {
+      featureSizes[i] = thresholds[i].size();
+      totalSize += featureSizes[i];
+    }
+    fitted = true;
+  }
+
+private:
+  // ======== Class-Conditional: per-class quantiles merged ========
+  void fitClassConditional(
+    const std::vector<std::vector<double>>& data,
+    const std::vector<std::string>& labels,
+    size_t n_samples, size_t n_features
+  ) {
+    std::map<std::string, std::vector<size_t>> classIndices;
+    for (size_t i = 0; i < n_samples; i++) {
+      classIndices[labels[i]].push_back(i);
+    }
+    size_t n_classes = classIndices.size();
+
+    std::vector<std::pair<std::string, size_t>> classAlloc;
+    size_t base = thermometerSize / n_classes;
+    size_t remainder = thermometerSize % n_classes;
+    size_t c = 0;
+    for (auto& ci : classIndices) {
+      classAlloc.push_back({ci.first, base + (c < remainder ? 1 : 0)});
+      c++;
+    }
+
+    valueRanges.resize(n_features);
+    featureSizes.assign(n_features, thermometerSize);
+    for (size_t f = 0; f < n_features; f++) {
+      std::vector<double> allThresholds;
+      allThresholds.reserve(thermometerSize);
+
+      for (auto& ca : classAlloc) {
+        const std::vector<size_t>& indices = classIndices[ca.first];
+        size_t nThresholds = ca.second;
+        if (nThresholds == 0 || indices.empty()) continue;
+
+        std::vector<double> classValues(indices.size());
+        for (size_t i = 0; i < indices.size(); i++) {
+          classValues[i] = data[indices[i]][f];
+        }
+        std::sort(classValues.begin(), classValues.end());
+
+        for (size_t k = 0; k < nThresholds; k++) {
+          double percentile = (double)(k + 1) / (double)(nThresholds + 1);
+          size_t index = (size_t)(percentile * (double)(classValues.size() - 1));
+          if (index >= classValues.size()) index = classValues.size() - 1;
+          allThresholds.push_back(classValues[index]);
+        }
+      }
+
+      std::sort(allThresholds.begin(), allThresholds.end());
+      valueRanges[f] = allThresholds;
+    }
+  }
+
+  // ======== MI Allocation: MI-based bit budget per feature ========
+  void fitMIAllocation(
+    const std::vector<std::vector<double>>& data,
+    const std::vector<std::string>& labels,
+    size_t n_samples, size_t n_features
+  ) {
+    size_t totalBudget = n_features * thermometerSize;
+
+    std::vector<double> miScores(n_features);
+    for (size_t f = 0; f < n_features; f++) {
+      std::vector<double> values(n_samples);
+      for (size_t i = 0; i < n_samples; i++) values[i] = data[i][f];
+      miScores[f] = computeMI(values, labels, thermometerSize);
+    }
+
+    featureSizes = allocateBits(miScores, totalBudget, minBitsPerFeature, n_features);
+
+    valueRanges.resize(n_features);
+    for (size_t f = 0; f < n_features; f++) {
+      std::vector<double> values(n_samples);
+      for (size_t i = 0; i < n_samples; i++) values[i] = data[i][f];
+      std::sort(values.begin(), values.end());
+
+      size_t bits = featureSizes[f];
+      valueRanges[f].resize(bits);
+      for (size_t k = 0; k < bits; k++) {
+        double percentile = (double)(k + 1) / (double)(bits + 1);
+        size_t index = (size_t)(percentile * (double)(n_samples - 1));
+        if (index >= n_samples) index = n_samples - 1;
+        valueRanges[f][k] = values[index];
+      }
+    }
+  }
+
+  // ======== Entropy-Weighted: concentrate thresholds at class overlap ========
+  void fitEntropyWeighted(
+    const std::vector<std::vector<double>>& data,
+    const std::vector<std::string>& labels,
+    size_t n_samples, size_t n_features
+  ) {
+    size_t windowSize = std::max((size_t)10, (size_t)std::sqrt((double)n_samples));
+    windowSize = std::min(windowSize, n_samples / 4);
+
+    featureSizes.assign(n_features, thermometerSize);
+    valueRanges.resize(n_features);
+    for (size_t f = 0; f < n_features; f++) {
+      std::vector<size_t> sortedIdx(n_samples);
+      for (size_t i = 0; i < n_samples; i++) sortedIdx[i] = i;
+      std::sort(sortedIdx.begin(), sortedIdx.end(),
+        [&](size_t a, size_t b) { return data[a][f] < data[b][f]; });
+
+      std::vector<double> weights(n_samples);
+      size_t halfW = windowSize / 2;
+
+      for (size_t i = 0; i < n_samples; i++) {
+        size_t lo = (i > halfW) ? i - halfW : 0;
+        size_t hi = std::min(n_samples, i + halfW + 1);
+        if (hi - lo > windowSize) {
+          if (lo == 0) hi = lo + windowSize;
+          else lo = hi - windowSize;
+        }
+
+        std::map<std::string, int> windowCounts;
+        for (size_t j = lo; j < hi; j++) {
+          windowCounts[labels[sortedIdx[j]]]++;
+        }
+
+        double wSize = (double)(hi - lo);
+        double entropy = 0.0;
+        for (auto& lc : windowCounts) {
+          double p = (double)lc.second / wSize;
+          if (p > 0.0) entropy -= p * std::log2(p);
+        }
+        weights[i] = entropy;
+      }
+
+      double maxW = *std::max_element(weights.begin(), weights.end());
+      double floor = (maxW > 0.0) ? 0.01 * maxW : 1.0;
+      for (size_t i = 0; i < n_samples; i++) weights[i] += floor;
+
+      std::vector<double> cumWeights(n_samples);
+      cumWeights[0] = weights[0];
+      for (size_t i = 1; i < n_samples; i++) {
+        cumWeights[i] = cumWeights[i - 1] + weights[i];
+      }
+      double totalWeight = cumWeights[n_samples - 1];
+
+      valueRanges[f].resize(thermometerSize);
+      for (size_t k = 0; k < thermometerSize; k++) {
+        double target = (double)(k + 1) / (double)(thermometerSize + 1) * totalWeight;
+        auto it = std::lower_bound(cumWeights.begin(), cumWeights.end(), target);
+        size_t index = (size_t)(it - cumWeights.begin());
+        if (index >= n_samples) index = n_samples - 1;
+        valueRanges[f][k] = data[sortedIdx[index]][f];
+      }
+    }
+  }
+
+  // ======== MI utilities ========
+  double computeMI(
+    const std::vector<double>& featureValues,
+    const std::vector<std::string>& labels,
+    size_t nBins
+  ) {
+    size_t n = featureValues.size();
+    if (n == 0 || nBins == 0) return 0.0;
+
+    std::vector<size_t> sortedIdx(n);
+    for (size_t i = 0; i < n; i++) sortedIdx[i] = i;
+    std::sort(sortedIdx.begin(), sortedIdx.end(),
+      [&](size_t a, size_t b) { return featureValues[a] < featureValues[b]; });
+
+    std::vector<size_t> binAssignment(n);
+    for (size_t i = 0; i < n; i++) {
+      binAssignment[sortedIdx[i]] = (i * nBins) / n;
+    }
+
+    std::map<std::string, size_t> labelIndex;
+    for (size_t i = 0; i < n; i++) {
+      if (labelIndex.find(labels[i]) == labelIndex.end()) {
+        size_t idx = labelIndex.size();
+        labelIndex[labels[i]] = idx;
+      }
+    }
+    size_t nLabels = labelIndex.size();
+
+    std::vector<std::vector<size_t>> joint(nBins, std::vector<size_t>(nLabels, 0));
+    for (size_t i = 0; i < n; i++) {
+      joint[binAssignment[i]][labelIndex[labels[i]]]++;
+    }
+
+    std::vector<size_t> binCounts(nBins, 0);
+    std::vector<size_t> labelCounts(nLabels, 0);
+    for (size_t b = 0; b < nBins; b++) {
+      for (size_t l = 0; l < nLabels; l++) {
+        binCounts[b] += joint[b][l];
+        labelCounts[l] += joint[b][l];
+      }
+    }
+
+    double mi = 0.0;
+    double dn = (double)n;
+    for (size_t b = 0; b < nBins; b++) {
+      if (binCounts[b] == 0) continue;
+      for (size_t l = 0; l < nLabels; l++) {
+        if (joint[b][l] == 0) continue;
+        double pbl = (double)joint[b][l] / dn;
+        double pb = (double)binCounts[b] / dn;
+        double pl = (double)labelCounts[l] / dn;
+        mi += pbl * std::log2(pbl / (pb * pl));
+      }
+    }
+    return std::max(mi, 0.0);
+  }
+
+  std::vector<size_t> allocateBits(
+    const std::vector<double>& miScores,
+    size_t totalBudget, size_t minBits, size_t n_features
+  ) {
+    std::vector<size_t> sizes(n_features, minBits);
+    size_t floorTotal = minBits * n_features;
+
+    if (floorTotal >= totalBudget) {
+      size_t perFeature = totalBudget / n_features;
+      size_t rem = totalBudget % n_features;
+      for (size_t f = 0; f < n_features; f++) {
+        sizes[f] = perFeature + (f < rem ? 1 : 0);
+      }
+      return sizes;
+    }
+
+    size_t remaining = totalBudget - floorTotal;
+    double totalMI = 0.0;
+    for (size_t f = 0; f < n_features; f++) totalMI += miScores[f];
+
+    if (totalMI <= 0.0) {
+      size_t perFeature = totalBudget / n_features;
+      size_t rem = totalBudget % n_features;
+      for (size_t f = 0; f < n_features; f++) {
+        sizes[f] = perFeature + (f < rem ? 1 : 0);
+      }
+      return sizes;
+    }
+
+    std::vector<double> fractional(n_features);
+    size_t allocated = 0;
+    for (size_t f = 0; f < n_features; f++) {
+      fractional[f] = (miScores[f] / totalMI) * (double)remaining;
+      sizes[f] += (size_t)fractional[f];
+      allocated += (size_t)fractional[f];
+    }
+
+    size_t leftover = remaining - allocated;
+    if (leftover > 0) {
+      std::vector<size_t> order(n_features);
+      for (size_t f = 0; f < n_features; f++) order[f] = f;
+      std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+        return (fractional[a] - (size_t)fractional[a]) > (fractional[b] - (size_t)fractional[b]);
+      });
+      for (size_t i = 0; i < leftover && i < n_features; i++) {
+        sizes[order[i]]++;
+      }
+    }
+    return sizes;
+  }
+
+protected:
+  size_t thermometerSize;
+  std::string method;
+  size_t minBitsPerFeature;
+  std::vector<size_t> featureSizes;
+  std::vector<std::vector<double>> valueRanges;
+  size_t totalSize;
+  bool fitted;
+};
+// Hand-tuned colour-mask binariser for objects with a small known palette
+// (Where's Waldo: red+white sweater, dark hair/glasses/beanie).
+//
+// Per pixel, emits 3 bits along channel-interleaved RGB triples:
+//   bit 0: is_red    — high R, low G, low B
+//   bit 1: is_white  — all three channels high
+//   bit 2: is_dark   — all three channels low
+//
+// Input is assumed to be a flat row-major (H*W*3) vector of values in [0,1],
+// channels interleaved as R,G,B per pixel. Output BinInput has 3*pixel_count bits.
+class ColorMaskBinarization : public BinBase {
+private:
+  double redMin;
+  double redChannelGap;
+  double whiteMin;
+  double darkMax;
+
+public:
+  ColorMaskBinarization(double redMin = 0.5,
+                        double redChannelGap = 0.10,
+                        double whiteMin = 0.75,
+                        double darkMax = 0.20)
+    : redMin(redMin), redChannelGap(redChannelGap), whiteMin(whiteMin), darkMax(darkMax) {}
+
+  BinInput transform(const std::vector<double>& data) {
+    if (data.size() % 3 != 0)
+      throw Exception("ColorMaskBinarization expects RGB triples; input size must be divisible by 3");
+    size_t n_px = data.size() / 3;
+    BinInput out(n_px * 3);
+    for (size_t i = 0; i < n_px; i++) {
+      double r = data[3 * i];
+      double g = data[3 * i + 1];
+      double b = data[3 * i + 2];
+      bool is_red   = (r > redMin) && (r - g > redChannelGap) && (r - b > redChannelGap);
+      bool is_white = (r > whiteMin) && (g > whiteMin) && (b > whiteMin);
+      bool is_dark  = (r < darkMax) && (g < darkMax) && (b < darkMax);
+      out.set(3 * i,     is_red   ? 1 : 0);
+      out.set(3 * i + 1, is_white ? 1 : 0);
+      out.set(3 * i + 2, is_dark  ? 1 : 0);
+    }
+    return out;
+  }
+
+  double getRedMin()        const { return redMin; }
+  double getRedChannelGap() const { return redChannelGap; }
+  double getWhiteMin()      const { return whiteMin; }
+  double getDarkMax()       const { return darkMax; }
+};
 class Model {
 public:
     // Model(std::string);
 
     virtual void train(const DataSet& dataset) = 0;
     virtual long getsizeof() const = 0;
+    // Minimal deployed state in bytes — one yardstick across model families: the
+    // learned table/seen-set needed at inference. Default = in-memory getsizeof();
+    // Wisard/ClusWisard/BloomWisard override with their deployable representation.
+    virtual long deployedSizeBytes() const { return getsizeof(); }
     virtual std::string json(std::string filename) const = 0;
 
     std::string json() const {
@@ -19214,21 +20222,41 @@ public:
     ignoreZero = c["ignoreZero"];
     base=c["base"];
     addresses = c["addresses"].get<std::vector<int>>();
-    checkLimitAddressSize(addresses.size(), base);
+    useLargeAddr = (base == 2 && (int)addresses.size() > 64);
 
-    RAMDataHandle handle(c["data"].get<std::string>());
-    positions = handle.get(0);
+    if(!useLargeAddr){
+      checkLimitAddressSize(addresses.size(), base);
+      RAMDataHandle handle(c["data"].get<std::string>());
+      positions = handle.get(0);
+    }
+    // Large-address deserialization not supported (not needed for experiments)
   }
   RAM(const int addressSize, const int entrySize, const bool ignoreZero=false, int base=2): ignoreZero(ignoreZero), base(base){
-    checkLimitAddressSize(addressSize, base);
+    useLargeAddr = (base == 2 && addressSize > 64);
+    if(!useLargeAddr){
+      checkLimitAddressSize(addressSize, base);
+    }
     addresses = std::vector<int>(addressSize);
     generateRandomAddresses(entrySize);
   }
   RAM(const std::vector<int> indexes, const bool ignoreZero=false, int base=2): addresses(indexes), ignoreZero(ignoreZero), base(base){
-    checkLimitAddressSize(indexes.size(), base);
+    useLargeAddr = (base == 2 && (int)indexes.size() > 64);
+    if(!useLargeAddr){
+      checkLimitAddressSize(indexes.size(), base);
+    }
   }
 
   int getVote(const BinInput& image) const {
+    if(useLargeAddr){
+      large_addr_t key = getLargeIndex(image);
+      if(ignoreZero){
+        bool allZero = true;
+        for(char c : key) if(c != 0){ allZero = false; break; }
+        if(allZero) return 0;
+      }
+      auto it = largePositions.find(key);
+      return (it != largePositions.end()) ? it->second : 0;
+    }
     addr_t index = getIndex(image);
     if(ignoreZero && index == 0)
       return 0;
@@ -19242,6 +20270,16 @@ public:
   }
 
   void train(const BinInput& image){
+    if(useLargeAddr){
+      large_addr_t key = getLargeIndex(image);
+      auto it = largePositions.find(key);
+      if(it == largePositions.end()){
+        largePositions.insert(it, std::pair<large_addr_t,content_t>(key, 1));
+      } else {
+        it->second++;
+      }
+      return;
+    }
     addr_t index = getIndex(image);
     auto it = positions.find(index);
     if(it == positions.end()){
@@ -19253,11 +20291,24 @@ public:
   }
 
   void untrain(const BinInput& image){
-      addr_t index = getIndex(image);
-      auto it = positions.find(index);
-      if(it != positions.end()){
+    if(useLargeAddr){
+      large_addr_t key = getLargeIndex(image);
+      auto it = largePositions.find(key);
+      if(it != largePositions.end()){
         it->second--;
       }
+      return;
+    }
+    addr_t index = getIndex(image);
+    auto it = positions.find(index);
+    if(it != positions.end()){
+      it->second--;
+    }
+  }
+
+  void reset() {
+    positions.clear();
+    largePositions.clear();
   }
 
   std::vector<std::vector<int>> getMentalImage() {
@@ -19266,6 +20317,20 @@ public:
       mentalPiece[i].resize(2);
       mentalPiece[i][0] = addresses[i];
       mentalPiece[i][1] = 0;
+    }
+
+    if(useLargeAddr){
+      for(auto j=largePositions.begin(); j!=largePositions.end(); ++j){
+        const large_addr_t& key = j->first;
+        for(unsigned int i=0; i<mentalPiece.size(); i++){
+          int byteIdx = i / 8;
+          int bitIdx = i % 8;
+          if(byteIdx < (int)key.size() && (key[byteIdx] & (1 << bitIdx))){
+            mentalPiece[i][1] += j->second;
+          }
+        }
+      }
+      return mentalPiece;
     }
 
     for(auto j=positions.begin(); j!=positions.end(); ++j){
@@ -19294,6 +20359,12 @@ public:
   }
 
   std::string getData() const {
+    if(useLargeAddr){
+      // Large-address serialization: return empty (not needed for experiments)
+      ram_t empty_ram;
+      RAMDataHandle handle(empty_ram);
+      return handle.data(0);
+    }
     RAMDataHandle handle(positions);
     return handle.data(0);
   }
@@ -19320,14 +20391,33 @@ public:
 
   long getsizeof() const{
     long size = sizeof(RAM);
-    size += addresses.size()*sizeof(addr_t);
-    size += positions.size()*(sizeof(addr_t)+sizeof(content_t));
+    size += addresses.size()*sizeof(int);
+    if(useLargeAddr){
+      int keyBytes = ((int)addresses.size() + 7) / 8;
+      size += largePositions.size()*(keyBytes+sizeof(content_t));
+    } else {
+      size += positions.size()*(sizeof(addr_t)+sizeof(content_t));
+    }
     return size;
+  }
+
+  long getNumEntries() const{
+    return useLargeAddr ? largePositions.size() : positions.size();
+  }
+
+  // Minimal deployed footprint of this RAM: the set of distinct seen addresses,
+  // each bit-packed as ceil(tupleSize/8) bytes (lossless, no false positives,
+  // unlike BloomWisard's fixed filter). The deployable analogue of the
+  // BTHOWeN/ULEEN/Bloom bit-table, on one comparable yardstick.
+  long deployedSizeBytes() const{
+    long bytesPerAddr = ((long)addresses.size() + 7) / 8;
+    return getNumEntries() * bytesPerAddr;
   }
 
   ~RAM(){
     addresses.clear();
     positions.clear();
+    largePositions.clear();
   }
 
 protected:
@@ -19343,10 +20433,24 @@ protected:
     return index;
   }
 
+  large_addr_t getLargeIndex(const BinInput& image) const{
+    int n = addresses.size();
+    int nbytes = (n + 7) / 8;
+    large_addr_t key(nbytes, '\0');
+    for(int i = 0; i < n; i++){
+      if(image[addresses[i]]){
+        key[i / 8] |= (char)(1 << (i % 8));
+      }
+    }
+    return key;
+  }
+
 
 private:
   std::vector<int> addresses;
   ram_t positions;
+  large_ram_t largePositions;
+  bool useLargeAddr = false;
   bool ignoreZero;
   int base;
 
@@ -19465,6 +20569,13 @@ public:
       }
   }
 
+  void reset() {
+    count = 0;
+    for (unsigned int i = 0; i < rams.size(); i++) {
+      rams[i].reset();
+    }
+  }
+
   int getNumberOfTrainings() const{
     return count;
   }
@@ -19518,6 +20629,14 @@ public:
     long size = sizeof(Discriminator);
     for(unsigned int i=0; i<rams.size(); i++){
       size += rams[i].getsizeof();
+    }
+    return size;
+  }
+
+  long deployedSizeBytes() const{
+    long size = 0;
+    for(unsigned int i=0; i<rams.size(); i++){
+      size += rams[i].deployedSizeBytes();
     }
     return size;
   }
@@ -19758,6 +20877,17 @@ public:
 
     value = c["completeAddressing"];
     mappingGenerator->completeAddressing = value.is_null() ? true : value.get<bool>();
+
+    softBleaching = false;
+    crossClassScoring = false;
+    negativeEvidence = false;
+    negativeAlpha = 0.0;
+    negativeMode = "uniform";
+    useRAMWeights = false;
+    useSharedDiscriminator = false;
+    sharedBeta = 0.0;
+    sharedDiscriminatorInitialized = false;
+    attentionWeighting = false;
   }
 
   Wisard(unsigned int addressSize, nl::json c={}) : Wisard(c){
@@ -19790,6 +20920,14 @@ public:
         makeDiscriminator(dataset.getLabel(i), dataset[i].size());
       }
       discriminators[dataset.getLabel(i)].train(dataset[i]);
+
+      if(useSharedDiscriminator){
+        if(!sharedDiscriminatorInitialized){
+          sharedDiscrim = Discriminator(mappingGenerator->getMapping("__shared__"), dataset[i].size(), ignoreZero, base);
+          sharedDiscriminatorInitialized = true;
+        }
+        sharedDiscrim.train(dataset[i]);
+      }
     }
   }
 
@@ -19818,6 +20956,42 @@ public:
         }
     }
     if(verbose) std::cout << "\r" << std::endl;
+  }
+
+  void reset() {
+    for (auto& d : discriminators) {
+      d.second.reset();
+    }
+  }
+
+  void trainSingle(const BinInput& input, const std::string& label) {
+    if (discriminators.find(label) == discriminators.end()) {
+      makeDiscriminator(label, input.size());
+    }
+    discriminators[label].train(input);
+
+    if(useSharedDiscriminator){
+      if(!sharedDiscriminatorInitialized){
+        sharedDiscrim = Discriminator(mappingGenerator->getMapping("__shared__"), input.size(), ignoreZero, base);
+        sharedDiscriminatorInitialized = true;
+      }
+      sharedDiscrim.train(input);
+    }
+  }
+
+  void untrainSingle(const BinInput& input, const std::string& label) {
+    auto d = discriminators.find(label);
+    if (d != discriminators.end()) {
+      d->second.untrain(input);
+    }
+  }
+
+  nl::json getMappingJson() const {
+    nl::json config;
+    config["mapping"] = nl::json(mappingGenerator->getMappings());
+    config["monoMapping"] = mappingGenerator->monoMapping;
+    config["completeAddressing"] = mappingGenerator->completeAddressing;
+    return config;
   }
 
   std::map<std::string,std::vector<int>> getMentalImages(){
@@ -19863,11 +21037,156 @@ public:
         totalTrainned += i.second.getNumberOfTrainings();
       }
     }
-    
+
     for(auto& i: discriminators){
       allvotes[i.first] = i.second.classify(image,totalTrainned);
     }
-    return classificationMethod->run(allvotes);
+
+    // Multi-resolution: reweight votes by RAM address size before Bleaching.
+    if(mappingGenerator->multiResolution){
+      for(auto& entry: allvotes){
+        auto it = discriminators.find(entry.first);
+        if(it != discriminators.end()){
+          std::vector<int> sizes = it->second.getTupleSizes();
+          for(size_t j = 0; j < entry.second.size() && j < sizes.size(); j++){
+            entry.second[j] *= sizes[j];
+          }
+        }
+      }
+    }
+
+    // Weighted RAM voting: multiply each RAM's vote by its learned weight.
+    if(useRAMWeights){
+      for(auto& entry: allvotes){
+        auto wit = ramWeights.find(entry.first);
+        if(wit != ramWeights.end()){
+          for(size_t j = 0; j < entry.second.size() && j < wit->second.size(); j++){
+            entry.second[j] = (int)(entry.second[j] * wit->second[j]);
+          }
+        }
+      }
+    }
+
+    // Attention-like weighting: weight each RAM by agreement with consensus.
+    if(attentionWeighting){
+      for(auto& entry: allvotes){
+        std::vector<int>& votes = entry.second;
+        double mean = 0.0;
+        double maxVal = 0.0;
+        for(size_t j = 0; j < votes.size(); j++){
+          mean += votes[j];
+          if(votes[j] > maxVal) maxVal = votes[j];
+        }
+        if(votes.size() > 0) mean /= votes.size();
+
+        for(size_t j = 0; j < votes.size(); j++){
+          double w = 1.0 - std::abs((double)votes[j] - mean) / (maxVal + 1e-9);
+          votes[j] = (int)(votes[j] * w);
+        }
+      }
+    }
+
+    // Cross-class scoring: normalize each RAM's vote by the total across all classes.
+    if(crossClassScoring){
+      size_t n_rams = 0;
+      for(auto& entry: allvotes){ n_rams = std::max(n_rams, entry.second.size()); }
+      int n_classes = (int)allvotes.size();
+
+      for(size_t j = 0; j < n_rams; j++){
+        int total = 0;
+        for(auto& entry: allvotes){
+          if(j < entry.second.size()) total += entry.second[j];
+        }
+        if(total > 0){
+          for(auto& entry: allvotes){
+            if(j < entry.second.size()){
+              entry.second[j] = entry.second[j] * n_classes / (total + 1);
+            }
+          }
+        }
+      }
+    }
+
+    // Compute per-class totals via softBleaching or classification method.
+    std::map<std::string, int> labels;
+
+    if(softBleaching){
+      int bleaching = 0;
+      bool looping = true;
+
+      while(looping){
+        int min = 0;
+        bool firstTime = true;
+
+        for(auto& entry: allvotes){
+          labels[entry.first] = 0;
+          for(size_t j = 0; j < entry.second.size(); j++){
+            if(entry.second[j] > bleaching){
+              labels[entry.first] += (entry.second[j] - bleaching);
+              if(firstTime || entry.second[j] < min){
+                min = entry.second[j];
+                firstTime = false;
+              }
+            }
+          }
+        }
+
+        bleaching = min;
+
+        int biggest = 0;
+        bool ambiguity = false;
+        for(auto& l: labels){
+          if(l.second > biggest){ biggest = l.second; ambiguity = false; }
+          else if((biggest - l.second) < 1){ ambiguity = true; }
+        }
+
+        looping = ambiguity && biggest > 1;
+      }
+    }
+    else{
+      labels = classificationMethod->run(allvotes);
+    }
+
+    // Shared discriminator: subtract background response from all class scores.
+    if(useSharedDiscriminator && sharedDiscriminatorInitialized){
+      std::vector<int> sharedVotes = sharedDiscrim.classify(image);
+      int sharedResponse = 0;
+      for(size_t j = 0; j < sharedVotes.size(); j++){
+        if(sharedVotes[j] > 0) sharedResponse++;
+      }
+      for(auto& l: labels){
+        l.second = (int)(l.second - sharedBeta * sharedResponse);
+      }
+    }
+
+    // Negative evidence: penalize each class based on other classes' responses.
+    if(negativeEvidence){
+      int totalAll = 0;
+      for(auto& l: labels) totalAll += l.second;
+
+      std::map<std::string, int> adjusted;
+      for(auto& l: labels){
+        int selfScore = l.second;
+        int othersSum = totalAll - selfScore;
+
+        if(negativeMode == "uniform"){
+          adjusted[l.first] = (int)(selfScore - negativeAlpha * othersSum);
+        }
+        else if(negativeMode == "max_competitor"){
+          int maxComp = 0;
+          for(auto& o: labels){
+            if(o.first != l.first && o.second > maxComp) maxComp = o.second;
+          }
+          adjusted[l.first] = (int)(selfScore - negativeAlpha * maxComp);
+        }
+        else{ // normalized
+          adjusted[l.first] = (int)(selfScore * 1000.0 / (1.0 + negativeAlpha * othersSum));
+        }
+      }
+      labels = adjusted;
+    }
+
+    return labels;
   }
 
   std::vector<std::map<std::string, int>> rank(const DataSet& images) const{
@@ -19877,6 +21196,124 @@ public:
         out[i] = rank(images[i]);
     }
     return out;
+  }
+
+  // Compute per-RAM quality weights from training data.
+  // Metrics: "entropy", "information_gain", "purity"
+  void computeRAMWeights(const DataSet& dataset, const std::string& metric = "entropy"){
+    // For each discriminator, track per-RAM activation counts per class.
+    // activations[discrim_label][ram_idx][sample_class] = count of times RAM fired
+    std::map<std::string, std::vector<std::map<std::string, int>>> activations;
+    std::map<std::string, std::vector<int>> totalActivations; // total fires per RAM per discrim
+
+    for(auto& d: discriminators){
+      int nRAMs = d.second.getNumberOfRAMS();
+      activations[d.first].resize(nRAMs);
+      totalActivations[d.first].resize(nRAMs, 0);
+    }
+
+    // Pass each training sample through all discriminators.
+    for(size_t i = 0; i < dataset.size(); i++){
+      const std::string& sampleClass = dataset.getLabel(i);
+      for(auto& d: discriminators){
+        std::vector<int> votes = d.second.classify(dataset[i]);
+        for(size_t j = 0; j < votes.size(); j++){
+          if(votes[j] > 0){
+            activations[d.first][j][sampleClass]++;
+            totalActivations[d.first][j]++;
+          }
+        }
+      }
+    }
+
+    // Compute weights from activation patterns.
+    ramWeights.clear();
+    int nClasses = (int)discriminators.size();
+
+    for(auto& d: discriminators){
+      int nRAMs = d.second.getNumberOfRAMS();
+      ramWeights[d.first].resize(nRAMs, 1.0);
+
+      for(int j = 0; j < nRAMs; j++){
+        int total = totalActivations[d.first][j];
+        if(total == 0){
+          ramWeights[d.first][j] = 0.0;
+          continue;
+        }
+
+        if(metric == "entropy"){
+          // Weight = 1 - normalized entropy of class distribution of activations
+          double entropy = 0.0;
+          for(auto& ac: activations[d.first][j]){
+            double p = (double)ac.second / total;
+            if(p > 0) entropy -= p * std::log2(p);
+          }
+          double maxEntropy = (nClasses > 1) ? std::log2((double)nClasses) : 1.0;
+          ramWeights[d.first][j] = 1.0 - entropy / maxEntropy;
+        }
+        else if(metric == "information_gain"){
+          // MI between binary RAM output (fires/doesn't) and class label
+          double nSamples = (double)dataset.size();
+          double pFire = total / nSamples;
+          double pNoFire = 1.0 - pFire;
+          double mi = 0.0;
+
+          for(auto& ac: activations[d.first][j]){
+            // Count total samples of this class
+            int classTotal = 0;
+            for(size_t s = 0; s < dataset.size(); s++){
+              if(dataset.getLabel(s) == ac.first) classTotal++;
+            }
+            double pClass = classTotal / nSamples;
+            // p(fire, class)
+            double pJoint = ac.second / nSamples;
+            if(pJoint > 0 && pFire > 0 && pClass > 0){
+              mi += pJoint * std::log2(pJoint / (pFire * pClass));
+            }
+            // p(no_fire, class)
+            double pJointNo = (classTotal - ac.second) / nSamples;
+            if(pJointNo > 0 && pNoFire > 0 && pClass > 0){
+              mi += pJointNo * std::log2(pJointNo / (pNoFire * pClass));
+            }
+          }
+          ramWeights[d.first][j] = mi;
+        }
+        else if(metric == "purity"){
+          // Fraction of activations belonging to this discriminator's class
+          auto it = activations[d.first][j].find(d.first);
+          int correctCount = (it != activations[d.first][j].end()) ? it->second : 0;
+          ramWeights[d.first][j] = (double)correctCount / total;
+        }
+      }
+    }
+
+    // Normalize weights to [0, 1] range per discriminator
+    for(auto& entry: ramWeights){
+      double maxW = 0.0;
+      for(double w: entry.second) if(w > maxW) maxW = w;
+      if(maxW > 0){
+        for(double& w: entry.second) w /= maxW;
+      }
+    }
+
+    useRAMWeights = true;
+  }
+
+  void setRAMWeights(const std::map<std::string, std::vector<double>>& weights){
+    ramWeights = weights;
+    useRAMWeights = true;
+  }
+
+  std::map<std::string, std::vector<double>> getRAMWeights() const{
+    return ramWeights;
+  }
+
+  void pruneRAMs(double threshold){
+    for(auto& entry: ramWeights){
+      for(size_t i = 0; i < entry.second.size(); i++){
+        if(entry.second[i] < threshold) entry.second[i] = 0.0;
+      }
+    }
   }
 
   std::map<std::string,std::vector<int>> getTupleSizes() const{
@@ -19892,6 +21329,14 @@ public:
     long size = sizeof(Wisard);
     for(auto& d: discriminators){
       size += d.first.size() + d.second.getsizeof();
+    }
+    return size;
+  }
+
+  long deployedSizeBytes() const override{
+    long size = 0;
+    for(auto& d: discriminators){
+      size += d.second.deployedSizeBytes();
     }
     return size;
   }
@@ -19917,6 +21362,603 @@ protected:
   bool ignoreZero;
   int base;
   bool balanced;
+  bool softBleaching;
+  bool crossClassScoring;
+
+  // Negative evidence
+  bool negativeEvidence;
+  double negativeAlpha;
+  std::string negativeMode;
+
+  // Weighted RAM voting
+  std::map<std::string, std::vector<double>> ramWeights;
+  bool useRAMWeights;
+
+  // Shared discriminator
+  bool useSharedDiscriminator;
+  double sharedBeta;
+  Discriminator sharedDiscrim;
+  bool sharedDiscriminatorInitialized;
+
+  // Attention-like weighting
+  bool attentionWeighting;
+};
+// MurmurHash3 - public domain hash function by Austin Appleby.
+// Simplified for wisardpkg Bloom filter double-hashing.
+// We only need two independent 32-bit hashes from an input to do
+// double hashing: h(i) = (h1 + i * h2) % numBits.
+
+#ifndef MURMUR3_H
+#define MURMUR3_H
+
+#include <cstdint>
+
+inline uint32_t murmur3_rotl32(uint32_t x, int8_t r) {
+  return (x << r) | (x >> (32 - r));
+}
+
+inline uint32_t murmur3_fmix32(uint32_t h) {
+  h ^= h >> 16;
+  h *= 0x85ebca6b;
+  h ^= h >> 13;
+  h *= 0xc2b2ae35;
+  h ^= h >> 16;
+  return h;
+}
+
+// MurmurHash3_x86_32: produces a single 32-bit hash.
+// Call with different seeds to get independent hashes for double hashing.
+inline uint32_t MurmurHash3_32(const void* key, int len, uint32_t seed) {
+  const uint8_t* data = (const uint8_t*)key;
+  const int nblocks = len / 4;
+
+  uint32_t h1 = seed;
+  const uint32_t c1 = 0xcc9e2d51;
+  const uint32_t c2 = 0x1b873593;
+
+  // body
+  const uint32_t* blocks = (const uint32_t*)(data + nblocks * 4);
+  for (int i = -nblocks; i; i++) {
+    uint32_t k1 = blocks[i];
+    k1 *= c1;
+    k1 = murmur3_rotl32(k1, 15);
+    k1 *= c2;
+    h1 ^= k1;
+    h1 = murmur3_rotl32(h1, 13);
+    h1 = h1 * 5 + 0xe6546b64;
+  }
+
+  // tail
+  const uint8_t* tail = (const uint8_t*)(data + nblocks * 4);
+  uint32_t k1 = 0;
+  switch (len & 3) {
+    case 3: k1 ^= (uint32_t)tail[2] << 16; // fallthrough
+    case 2: k1 ^= (uint32_t)tail[1] << 8;  // fallthrough
+    case 1: k1 ^= (uint32_t)tail[0];
+            k1 *= c1; k1 = murmur3_rotl32(k1, 15); k1 *= c2; h1 ^= k1;
+  }
+
+  // finalization
+  h1 ^= len;
+  h1 = murmur3_fmix32(h1);
+  return h1;
+}
+
+#endif // MURMUR3_H
+// Locality-Sensitive Hashing alternatives for Bloom WiSARD.
+// SimHash: generates a binary signature from random hyperplanes, then uses
+// MurmurHash3 with different seeds to produce independent Bloom filter positions.
+
+#ifndef LSH_H
+#define LSH_H
+
+#include <vector>
+#include <cstdlib>
+#include <cmath>
+
+class SimHasher {
+public:
+  SimHasher() : numHashes(0), inputDim(0), numBits(0), numHyperplanes(0) {}
+
+  SimHasher(int numBits, int numHashes, int inputDim)
+    : numBits(numBits), numHashes(numHashes), inputDim(inputDim) {
+    // Number of hyperplanes determines the SimHash signature length.
+    // Use enough hyperplanes for a meaningful signature (at least 64 bits).
+    numHyperplanes = std::max(64, inputDim * 2);
+
+    // Generate random hyperplanes for SimHash signature.
+    hyperplanes.resize(numHyperplanes);
+    for (int h = 0; h < numHyperplanes; h++) {
+      hyperplanes[h].resize(inputDim);
+      for (int d = 0; d < inputDim; d++) {
+        hyperplanes[h][d] = (rand() % 2 == 0) ? 1.0 : -1.0;
+      }
+    }
+  }
+
+  // Compute hash positions using SimHash signature + MurmurHash3.
+  // 1. Compute a binary SimHash signature from the input (preserves similarity).
+  // 2. Hash the signature with MurmurHash3 using different seeds for each position.
+  // This produces independent positions while preserving locality sensitivity.
+  std::vector<int> computeHashes(const std::vector<int>& key) const {
+    // Step 1: Compute SimHash binary signature
+    // Each bit is the sign of dot(key, hyperplane[h])
+    int sigBytes = (numHyperplanes + 7) / 8;
+    std::vector<uint8_t> signature(sigBytes, 0);
+
+    for (int h = 0; h < numHyperplanes; h++) {
+      double dot = 0.0;
+      int dimLimit = std::min((int)key.size(), (int)hyperplanes[h].size());
+      for (int d = 0; d < dimLimit; d++) {
+        dot += key[d] * hyperplanes[h][d];
+      }
+      if (dot >= 0) {
+        signature[h / 8] |= (1 << (h % 8));
+      }
+    }
+
+    // Step 2: Hash the signature with MurmurHash3, different seed per position
+    std::vector<int> positions(numHashes);
+    for (int i = 0; i < numHashes; i++) {
+      uint32_t hashVal = MurmurHash3_32(signature.data(), sigBytes, (uint32_t)(i + 1));
+      positions[i] = (int)(hashVal % (uint32_t)numBits);
+    }
+    return positions;
+  }
+
+private:
+  int numBits;
+  int numHashes;
+  int inputDim;
+  int numHyperplanes;
+  std::vector<std::vector<double>> hyperplanes;
+};
+
+#endif // LSH_H
+// Counting Bloom filter for Bloom WiSARD RAM nodes.
+// Stores integer counters instead of bits, enabling bleaching (threshold-based voting).
+// Supports MurmurHash3 double-hashing, SimHash LSH, and H3 universal hashing
+// (Carter & Wegman, 1979) — the hash family used by BTHOWeN (Susskind et al., PACT 2022).
+
+class BloomFilter {
+public:
+  BloomFilter() : numBits(0), numHashes(0), hashMode("murmur") {}
+
+  BloomFilter(int numBits, int numHashes, const std::string& hashMode = "murmur")
+    : numBits(numBits), numHashes(numHashes), hashMode(hashMode) {
+    counters.resize(numBits, 0);
+  }
+
+  void initSimHash(int inputDim) {
+    simHasher = SimHasher(numBits, numHashes, inputDim);
+  }
+
+  // Initialise H3 random constants (numHashes rows, keyLength columns) for a given
+  // RAM tuple size. Each hash is XOR over the columns where the bitvector key is 1,
+  // reduced modulo numBits. This matches the reference BTHOWeN implementation.
+  void initH3(int keyLength) {
+    h3Constants.assign(numHashes, std::vector<uint64_t>(keyLength));
+    for (int i = 0; i < numHashes; i++) {
+      for (int j = 0; j < keyLength; j++) {
+        h3Constants[i][j] = (uint64_t)((uint64_t)rand() * RAND_MAX + (uint64_t)rand());
+      }
+    }
+  }
+
+  void add(const std::vector<int>& key) {
+    std::vector<int> positions = computeHashes(key);
+    for (int pos : positions) {
+      counters[pos]++;
+    }
+  }
+
+  bool query(const std::vector<int>& key) const {
+    std::vector<int> positions = computeHashes(key);
+    for (int pos : positions) {
+      if (counters[pos] == 0) return false;
+    }
+    return true;
+  }
+
+  // Minimum counter value across hash positions (counting Bloom filter semantics).
+  // This is the best estimate of how many times the key was inserted.
+  int getMinCount(const std::vector<int>& key) const {
+    std::vector<int> positions = computeHashes(key);
+    int minVal = counters[positions[0]];
+    for (int i = 1; i < (int)positions.size(); i++) {
+      if (counters[positions[i]] < minVal) {
+        minVal = counters[positions[i]];
+      }
+    }
+    return minVal;
+  }
+
+  // Count how many of the k hash positions are non-zero (for soft matching).
+  int count(const std::vector<int>& key) const {
+    std::vector<int> positions = computeHashes(key);
+    int c = 0;
+    for (int pos : positions) {
+      if (counters[pos] > 0) c++;
+    }
+    return c;
+  }
+
+  void reset() {
+    std::fill(counters.begin(), counters.end(), 0);
+  }
+
+  int getNumBits() const { return numBits; }
+  int getNumHashes() const { return numHashes; }
+
+  // In-memory footprint in bytes: the counting Bloom filter stores one int
+  // counter per position (counters), plus the H3 constant matrix when in h3 mode.
+  long getsizeof() const {
+    long size = sizeof(BloomFilter);
+    size += (long)counters.size() * sizeof(int);
+    size += (long)h3Constants.size() * sizeof(std::vector<uint64_t>);
+    for (const auto& row : h3Constants) size += (long)row.size() * sizeof(uint64_t);
+    return size;
+  }
+
+private:
+  std::vector<int> computeHashes(const std::vector<int>& key) const {
+    if (hashMode == "simhash") {
+      return simHasher.computeHashes(key);
+    }
+
+    if (hashMode == "h3") {
+      // H3: for each hash function i, XOR all h3Constants[i][j] where key[j] == 1,
+      // then reduce modulo numBits. h3Constants must be initialised via initH3().
+      std::vector<int> positions(numHashes);
+      for (int i = 0; i < numHashes; i++) {
+        uint64_t h = 0;
+        for (size_t j = 0; j < key.size(); j++) {
+          if (key[j]) h ^= h3Constants[i][j];
+        }
+        positions[i] = (int)(h % (uint64_t)numBits);
+      }
+      return positions;
+    }
+
+    // MurmurHash3 double-hashing: h(i) = (h1 + i * h2) % numBits
+    // Pack key into bytes for hashing.
+    int keyBytes = (int)(key.size() * sizeof(int));
+    uint32_t h1 = MurmurHash3_32(key.data(), keyBytes, 0);
+    uint32_t h2 = MurmurHash3_32(key.data(), keyBytes, h1);
+
+    std::vector<int> positions(numHashes);
+    for (int i = 0; i < numHashes; i++) {
+      positions[i] = (int)((h1 + (uint32_t)i * h2) % (uint32_t)numBits);
+    }
+    return positions;
+  }
+
+  int numBits;
+  int numHashes;
+  std::string hashMode;
+  std::vector<int> counters;
+  SimHasher simHasher;
+  std::vector<std::vector<uint64_t>> h3Constants;  // [numHashes][keyLength], used when hashMode == "h3"
+};
+// BloomRAM: a RAM node that uses a Bloom filter instead of a hash map.
+// Training adds the addressed bits to the filter; classification queries membership.
+
+class BloomRAM {
+public:
+  BloomRAM() : ignoreZero(false), base(2) {}
+
+  BloomRAM(const std::vector<int>& addresses, int numBits, int numHashes,
+           bool ignoreZero = false, int base = 2, const std::string& hashMode = "murmur")
+    : addresses(addresses), filter(numBits, numHashes, hashMode),
+      ignoreZero(ignoreZero), base(base) {}
+
+  void initSimHash() {
+    filter.initSimHash((int)addresses.size());
+  }
+
+  void initH3() {
+    filter.initH3((int)addresses.size());
+  }
+
+  void train(const BinInput& image) {
+    std::vector<int> key = getKey(image);
+    if (ignoreZero && isZeroKey(key)) return;
+    filter.add(key);
+  }
+
+  int getVote(const BinInput& image) const {
+    std::vector<int> key = getKey(image);
+    if (ignoreZero && isZeroKey(key)) return 0;
+    return filter.getMinCount(key);
+  }
+
+  // Soft vote: count of matching hash positions (0 to numHashes).
+  int getSoftVote(const BinInput& image) const {
+    std::vector<int> key = getKey(image);
+    if (ignoreZero && isZeroKey(key)) return 0;
+    return filter.count(key);
+  }
+
+  void reset() {
+    filter.reset();
+  }
+
+  int getAddressSize() const { return (int)addresses.size(); }
+
+  // In-memory footprint in bytes: the tuple addresses plus the Bloom filter's
+  // heap (the filter struct itself is already inside sizeof(BloomRAM)).
+  long getsizeof() const {
+    long size = sizeof(BloomRAM);
+    size += (long)addresses.size() * sizeof(int);
+    size += filter.getsizeof() - (long)sizeof(BloomFilter);
+    return size;
+  }
+
+private:
+  std::vector<int> getKey(const BinInput& image) const {
+    std::vector<int> key(addresses.size());
+    for (size_t i = 0; i < addresses.size(); i++) {
+      key[i] = image[addresses[i]];
+    }
+    return key;
+  }
+
+  bool isZeroKey(const std::vector<int>& key) const {
+    for (int v : key) {
+      if (v != 0) return false;
+    }
+    return true;
+  }
+
+  std::vector<int> addresses;
+  BloomFilter filter;
+  bool ignoreZero;
+  int base;
+};
+// BloomDiscriminator: a set of BloomRAM nodes forming one class's memory.
+
+class BloomDiscriminator {
+public:
+  BloomDiscriminator() : entrySize(0), count(0) {}
+
+  BloomDiscriminator(std::vector<std::vector<int>> mapping, int entrySize,
+                     int numBits, int numHashes, bool ignoreZero = false,
+                     int base = 2, const std::string& hashMode = "murmur")
+    : entrySize(entrySize), count(0) {
+    for (size_t i = 0; i < mapping.size(); i++) {
+      rams.push_back(BloomRAM(mapping[i], numBits, numHashes, ignoreZero, base, hashMode));
+      if (hashMode == "simhash") {
+        rams.back().initSimHash();
+      } else if (hashMode == "h3") {
+        rams.back().initH3();
+      }
+    }
+  }
+
+  void train(const BinInput& image) {
+    count++;
+    for (size_t i = 0; i < rams.size(); i++) {
+      rams[i].train(image);
+    }
+  }
+
+  std::vector<int> classify(const BinInput& image) const {
+    std::vector<int> votes(rams.size());
+    for (size_t i = 0; i < rams.size(); i++) {
+      votes[i] = rams[i].getVote(image);
+    }
+    return votes;
+  }
+
+  void reset() {
+    count = 0;
+    for (size_t i = 0; i < rams.size(); i++) {
+      rams[i].reset();
+    }
+  }
+
+  int getNumberOfRAMS() const { return (int)rams.size(); }
+  int getNumberOfTrainings() const { return count; }
+
+  // In-memory footprint in bytes: the BloomRAM structs held in the rams vector
+  // plus each RAM's own heap (addresses + filter counters).
+  long getsizeof() const {
+    long size = sizeof(BloomDiscriminator);
+    size += (long)rams.size() * sizeof(BloomRAM);
+    for (const auto& r : rams) size += r.getsizeof() - (long)sizeof(BloomRAM);
+    return size;
+  }
+
+private:
+  std::vector<BloomRAM> rams;
+  int entrySize;
+  int count;
+};
+// BloomWisard: WiSARD classifier using Bloom filter RAMs instead of hash maps.
+// Supports MurmurHash3 (standard) and SimHash (locality-sensitive) hashing.
+
+class BloomWisard: public ClassificationModel {
+public:
+  BloomWisard(nl::json c = {}) {
+    nl::json value;
+
+    value = c["classificationMethod"];
+    if (value.is_null()) {
+      classificationMethod = new Bleaching();
+    } else {
+      classificationMethod = ClassificationMethods::load(value);
+    }
+
+    value = c["verbose"];
+    verbose = value.is_null() ? false : value.get<bool>();
+
+    value = c["ignoreZero"];
+    ignoreZero = value.is_null() ? false : value.get<bool>();
+
+    base = 2;
+
+    value = c["mappingGenerator"];
+    if (value.is_null()) {
+      mappingGenerator = new RandomMapping();
+    } else {
+      mappingGenerator = MappingGeneratorHelper::load(value);
+    }
+
+    value = c["monoMapping"];
+    mappingGenerator->monoMapping = value.is_null() ? false : value.get<bool>();
+
+    value = c["completeAddressing"];
+    mappingGenerator->completeAddressing = value.is_null() ? true : value.get<bool>();
+
+    numBits = 1024;
+    numHashes = 3;
+    hashMode = "murmur";
+  }
+
+  BloomWisard(unsigned int addressSize, int numBits, int numHashes, nl::json c = {})
+    : BloomWisard(c) {
+    mappingGenerator->setTupleSize(addressSize);
+    this->numBits = numBits;
+    this->numHashes = numHashes;
+  }
+
+  ~BloomWisard() {
+    discriminators.clear();
+  }
+
+  void train(const DataSet& dataset) {
+    for (size_t i = 0; i < dataset.size(); i++) {
+      if (verbose) std::cout << "\rtraining " << i + 1 << " of " << dataset.size();
+      if (discriminators.find(dataset.getLabel(i)) == discriminators.end()) {
+        makeDiscriminator(dataset.getLabel(i), dataset[i].size());
+      }
+      discriminators[dataset.getLabel(i)].train(dataset[i]);
+    }
+  }
+
+  std::vector<std::string> classify(const DataSet& images) const {
+    std::vector<std::string> labels(images.size());
+    for (unsigned int i = 0; i < images.size(); i++) {
+      if (verbose) std::cout << "\rclassifying " << i + 1 << " of " << images.size();
+      labels[i] = classify(images[i]);
+    }
+    if (verbose) std::cout << "\r" << std::endl;
+    return labels;
+  }
+
+  std::string classify(const BinInput& input) const {
+    std::map<std::string, int> candidates = rank(input);
+    return classificationMethod->getBiggestCandidate(candidates);
+  }
+
+  std::map<std::string, int> rank(const BinInput& image) const {
+    std::map<std::string, std::vector<int>> allvotes;
+
+    for (auto& i : discriminators) {
+      allvotes[i.first] = i.second.classify(image);
+    }
+
+    return classificationMethod->run(allvotes);
+  }
+
+  std::vector<std::map<std::string, int>> rank(const DataSet& images) const {
+    std::vector<std::map<std::string, int>> out(images.size());
+    for (unsigned int i = 0; i < images.size(); i++) {
+      out[i] = rank(images[i]);
+    }
+    return out;
+  }
+
+  // Returns the raw per-RAM vote vector for each class, before any bleaching
+  // is applied. Each vector entry is the counting-Bloom-filter min-count for
+  // that RAM. Lets Python drive a custom bleach-search loop (used by BTHOWeN).
+  std::map<std::string, std::vector<int>> getRawVotes(const BinInput& image) const {
+    std::map<std::string, std::vector<int>> allvotes;
+    for (auto& i : discriminators) {
+      allvotes[i.first] = i.second.classify(image);
+    }
+    return allvotes;
+  }
+
+  std::vector<std::map<std::string, std::vector<int>>> getRawVotes(const DataSet& images) const {
+    std::vector<std::map<std::string, std::vector<int>>> out(images.size());
+    for (unsigned int i = 0; i < images.size(); i++) {
+      out[i] = getRawVotes(images[i]);
+    }
+    return out;
+  }
+
+  // Number of RAMs per discriminator (uniform across discriminators after training).
+  // Returns 0 if the model has not yet been trained.
+  int getNumberOfRAMS() const {
+    if (discriminators.empty()) return 0;
+    return discriminators.begin()->second.getNumberOfRAMS();
+  }
+
+  int getNumBits() const { return numBits; }
+  int getNumHashes() const { return numHashes; }
+  std::string getHashMode() const { return hashMode; }
+
+  void reset() {
+    for (auto& d : discriminators) {
+      d.second.reset();
+    }
+  }
+
+  std::string json(std::string filename = "") const {
+    nl::json config = {
+      {"version", __version__},
+      {"verbose", verbose},
+      {"ignoreZero", ignoreZero},
+      {"numBits", numBits},
+      {"numHashes", numHashes},
+      {"hashMode", hashMode}
+    };
+    return config.dump();
+  }
+
+  // In-memory footprint in bytes. Mirrors Wisard::getsizeof(): the model struct
+  // plus, per discriminator, the label string and the discriminator's full size
+  // (its BloomRAM nodes and their Bloom-filter counters). The previous version
+  // returned only sizeof(BloomWisard) (~88 B), ignoring all filter storage.
+  long getsizeof() const override {
+    long size = sizeof(BloomWisard);
+    for (const auto& d : discriminators) {
+      size += (long)d.first.size() + d.second.getsizeof();
+    }
+    return size;
+  }
+
+  // Deployed bit-table: numRAMs * numBits, 1 bit per filter position (the
+  // fixed-budget representation actually shipped). On the same yardstick as
+  // Wisard/ClusWisard::deployedSizeBytes() (their lossless seen-address set).
+  long deployedSizeBytes() const override {
+    return ((long)getNumberOfRAMS() * (long)getNumBits() + 7) / 8;
+  }
+
+  void setHashMode(const std::string& mode) {
+    hashMode = mode;
+  }
+
+protected:
+  void makeDiscriminator(std::string label, int entrySize) {
+    if (mappingGenerator->getEntrySize() < 2) {
+      mappingGenerator->setEntrySize(entrySize);
+    }
+    discriminators[label] = BloomDiscriminator(
+      mappingGenerator->getMapping(label), entrySize,
+      numBits, numHashes, ignoreZero, base, hashMode);
+  }
+
+  std::map<std::string, BloomDiscriminator> discriminators;
+  ClassificationBase* classificationMethod;
+  MappingGenerator* mappingGenerator;
+  bool verbose;
+  bool ignoreZero;
+  int base;
+  int numBits;
+  int numHashes;
+  std::string hashMode;
 };
 
 class Cluster {
@@ -20069,6 +22111,14 @@ public:
     long size = sizeof(Cluster);
     for(auto& d: discriminators){
       size += sizeof(int) + d.second->getsizeof();
+    }
+    return size;
+  }
+
+  long deployedSizeBytes() const{
+    long size = 0;
+    for(auto& d: discriminators){
+      size += d.second->deployedSizeBytes();
     }
     return size;
   }
@@ -20272,6 +22322,14 @@ public:
     size += unsupervisedCluster.getsizeof();
     for (auto &i : clusters) {
       size += i.first.size() + i.second.getsizeof();
+    }
+    return size;
+  }
+
+  long deployedSizeBytes() const override {
+    long size = unsupervisedCluster.deployedSizeBytes();
+    for (auto &i : clusters) {
+      size += i.second.deployedSizeBytes();
     }
     return size;
   }
@@ -21528,6 +23586,363 @@ protected:
   void makeRegressionWisard(const int index){
     rews[index] = new RegressionWisard(addressSize, completeAddressing, orderedMapping, mean, minZero, minOne, steps, mapping);
   }
+};
+class StochasticThermometer : public BinBase {
+public:
+  StochasticThermometer(const size_t thermometerSize)
+    : thermometerSize(thermometerSize), fitted(false) {
+    std::srand(std::time(NULL));
+  }
+
+  void fit(const std::vector<std::vector<double>>& data) {
+    if (data.empty()) return;
+    size_t n_samples = data.size();
+    size_t n_features = data[0].size();
+
+    valueRanges.resize(n_features);
+
+    for (size_t f = 0; f < n_features; f++) {
+      std::vector<double> values(n_samples);
+      for (size_t i = 0; i < n_samples; i++) {
+        values[i] = data[i][f];
+      }
+      std::sort(values.begin(), values.end());
+
+      valueRanges[f].resize(thermometerSize);
+      for (size_t k = 0; k < thermometerSize; k++) {
+        double percentile = (double)(k + 1) / (double)(thermometerSize + 1);
+        size_t index = (size_t)(percentile * (double)(n_samples - 1));
+        if (index >= n_samples) index = n_samples - 1;
+        valueRanges[f][k] = values[index];
+      }
+    }
+
+    fitted = true;
+  }
+
+  double optimize(
+    const std::vector<std::vector<double>>& data,
+    const std::vector<std::string>& labels,
+    int addressSize,
+    double validationSize = 0.2,
+    int rounds = 5,
+    int stepsPerThreshold = 100,
+    int numThreads = 0,
+    double maxShiftRatio = 0.5,
+    int earlyStopWindow = 0
+  ) {
+    if (!fitted) {
+      throw Exception("StochasticThermometer must be fitted before optimize!");
+    }
+    if (data.size() != labels.size()) {
+      throw Exception("Data and labels must have the same size!");
+    }
+
+    size_t n = data.size();
+    size_t valCount = (size_t)(validationSize * n);
+    if (valCount == 0) valCount = 1;
+    size_t trainCount = n - valCount;
+
+    // Shuffle indices for train/validation split
+    std::vector<size_t> indices(n);
+    for (size_t i = 0; i < n; i++) indices[i] = i;
+    for (size_t i = n - 1; i > 0; i--) {
+      size_t j = std::rand() % (i + 1);
+      std::swap(indices[i], indices[j]);
+    }
+
+    std::vector<std::vector<double>> trainData(trainCount), valData(valCount);
+    std::vector<std::string> trainLabels(trainCount), valLabels(valCount);
+    for (size_t i = 0; i < trainCount; i++) {
+      trainData[i] = data[indices[i]];
+      trainLabels[i] = labels[indices[i]];
+    }
+    for (size_t i = 0; i < valCount; i++) {
+      valData[i] = data[indices[trainCount + i]];
+      valLabels[i] = labels[indices[trainCount + i]];
+    }
+
+    size_t n_features = valueRanges.size();
+
+    // Pre-binarize all samples once into BinInput (compact bitpacked form)
+    std::vector<BinInput> trainBinInputs(trainCount);
+    std::vector<BinInput> valBinInputs(valCount);
+    for (size_t i = 0; i < trainCount; i++) {
+      trainBinInputs[i] = transform(trainData[i]);
+    }
+    for (size_t i = 0; i < valCount; i++) {
+      valBinInputs[i] = transform(valData[i]);
+    }
+
+    // Create a master Wisard with a fixed random mapping.
+    Wisard masterWisard(addressSize);
+
+    // Collect unique labels and force discriminator/mapping creation
+    std::vector<std::string> uniqueLabels;
+    for (size_t i = 0; i < trainCount; i++) {
+      bool found = false;
+      for (size_t j = 0; j < uniqueLabels.size(); j++) {
+        if (uniqueLabels[j] == trainLabels[i]) { found = true; break; }
+      }
+      if (!found) {
+        masterWisard.trainSingle(trainBinInputs[i], trainLabels[i]);
+        uniqueLabels.push_back(trainLabels[i]);
+      }
+    }
+    masterWisard.reset();
+
+    // Extract the mapping so thread-local Wisards use the same bit-to-RAM assignment
+    nl::json mappingConfig = masterWisard.getMappingJson();
+
+    // Determine thread count
+    int nThreads = numThreads > 0 ? numThreads : (int)std::thread::hardware_concurrency();
+    if (nThreads < 1) nThreads = 1;
+
+    // Pre-create thread-local Wisards with the same mapping
+    std::vector<Wisard> threadWisards;
+    threadWisards.reserve(nThreads);
+    for (int t = 0; t < nThreads; t++) {
+      threadWisards.emplace_back(addressSize, mappingConfig);
+      // Force discriminator creation by training one sample per class
+      for (size_t j = 0; j < uniqueLabels.size(); j++) {
+        threadWisards.back().trainSingle(trainBinInputs[0], uniqueLabels[j]);
+      }
+      threadWisards.back().reset();
+    }
+
+    // Pre-allocate thread-local BinInput copies (reused across coordinates)
+    std::vector<std::vector<BinInput>> threadTrainBins(nThreads);
+    std::vector<std::vector<BinInput>> threadValBins(nThreads);
+
+    // Initial accuracy using master Wisard
+    for (size_t i = 0; i < trainCount; i++) {
+      masterWisard.trainSingle(trainBinInputs[i], trainLabels[i]);
+    }
+    double bestAcc = classifyValidation(masterWisard, valBinInputs, valLabels);
+
+    // Build list of all (feature, threshold_index) pairs
+    std::vector<std::pair<size_t, size_t>> coords;
+    for (size_t f = 0; f < n_features; f++) {
+      for (size_t k = 0; k < valueRanges[f].size(); k++) {
+        coords.push_back({f, k});
+      }
+    }
+
+    int halfSteps = stepsPerThreshold / 2;
+
+    for (int round = 0; round < rounds; round++) {
+      // Randomize threshold processing order each round
+      for (size_t i = coords.size() - 1; i > 0; i--) {
+        size_t j = std::rand() % (i + 1);
+        std::swap(coords[i], coords[j]);
+      }
+
+      for (size_t ci = 0; ci < coords.size(); ci++) {
+        size_t f = coords[ci].first;
+        size_t k = coords[ci].second;
+        size_t bitPos = f * thermometerSize + k;
+
+        double originalValue = valueRanges[f][k];
+
+        double gapLeft = (k > 0) ? (valueRanges[f][k] - valueRanges[f][k - 1]) : valueRanges[f][k];
+        double gapRight = (k < valueRanges[f].size() - 1) ? (valueRanges[f][k + 1] - valueRanges[f][k]) : gapLeft;
+        double gap = std::min(gapLeft, gapRight);
+
+        if (gap <= 0.0) continue;
+
+        // Pre-generate all candidate thresholds (left + right)
+        // maxShiftRatio controls search range: 0.5 = up to 50% of gap, 0.2 = up to 20%
+        std::vector<double> candidateThresholds(stepsPerThreshold);
+        for (int s = 0; s < halfSteps; s++) {
+          double bandLow = (double)s / (double)halfSteps * maxShiftRatio;
+          double bandHigh = (double)(s + 1) / (double)halfSteps * maxShiftRatio;
+          double randInBand = bandLow + ((double)std::rand() / RAND_MAX) * (bandHigh - bandLow);
+          candidateThresholds[s] = originalValue - randInBand * gap;
+        }
+        for (int s = 0; s < halfSteps; s++) {
+          double bandLow = (double)s / (double)halfSteps * maxShiftRatio;
+          double bandHigh = (double)(s + 1) / (double)halfSteps * maxShiftRatio;
+          double randInBand = bandLow + ((double)std::rand() / RAND_MAX) * (bandHigh - bandLow);
+          candidateThresholds[halfSteps + s] = originalValue + randInBand * gap;
+        }
+
+        // Evaluate all candidates in parallel.
+        // Each thread gets its own Wisard and BinInput copies.
+        std::vector<double> candidateAccuracies(stepsPerThreshold, -1.0);
+
+        // Snapshot master BinInputs for this coordinate
+        for (int t = 0; t < nThreads; t++) {
+          threadTrainBins[t] = trainBinInputs;
+          threadValBins[t] = valBinInputs;
+        }
+
+        // Parallel evaluation of candidates
+        auto evaluateBatch = [&](int threadId, int startIdx, int endIdx) {
+          Wisard& w = threadWisards[threadId];
+          std::vector<BinInput>& tBins = threadTrainBins[threadId];
+          std::vector<BinInput>& vBins = threadValBins[threadId];
+
+          for (int s = startIdx; s < endIdx; s++) {
+            double threshold = candidateThresholds[s];
+
+            // Modify the single bit for this threshold
+            for (size_t i = 0; i < trainCount; i++) {
+              tBins[i].set(bitPos, (trainData[i][f] > threshold) ? 1 : 0);
+            }
+            for (size_t i = 0; i < valCount; i++) {
+              vBins[i].set(bitPos, (valData[i][f] > threshold) ? 1 : 0);
+            }
+
+            // Reset, train, classify
+            w.reset();
+            for (size_t i = 0; i < trainCount; i++) {
+              w.trainSingle(tBins[i], trainLabels[i]);
+            }
+
+            int correct = 0;
+            for (size_t i = 0; i < valCount; i++) {
+              if (w.classify(vBins[i]) == valLabels[i]) correct++;
+            }
+            candidateAccuracies[s] = (double)correct / (double)valCount;
+          }
+        };
+
+        // Evaluate candidates in parallel, with optional per-threshold early stopping.
+        // earlyStopWindow > 0: evaluate left scan first; if no improvement in the
+        // first earlyStopWindow candidates, skip the right scan entirely.
+        if (earlyStopWindow > 0) {
+          // Evaluate left scan
+          parallelFor(0, halfSteps, nThreads, evaluateBatch, threadWisards);
+
+          // Check if any left candidate improved
+          bool leftImproved = false;
+          int windowEnd = std::min(earlyStopWindow, halfSteps);
+          for (int s = 0; s < windowEnd; s++) {
+            if (candidateAccuracies[s] > bestAcc) { leftImproved = true; break; }
+          }
+
+          // If early window showed improvement, or no early stop window check needed,
+          // evaluate the rest
+          if (leftImproved) {
+            parallelFor(halfSteps, stepsPerThreshold, nThreads, evaluateBatch, threadWisards);
+          }
+        } else {
+          // No early stopping: evaluate all candidates
+          parallelFor(0, stepsPerThreshold, nThreads, evaluateBatch, threadWisards);
+        }
+
+        // Find best candidate
+        double bestValue = originalValue;
+        double bestThresholdAcc = bestAcc;
+        for (int s = 0; s < stepsPerThreshold; s++) {
+          if (candidateAccuracies[s] > bestThresholdAcc) {
+            bestThresholdAcc = candidateAccuracies[s];
+            bestValue = candidateThresholds[s];
+          }
+        }
+
+        // Commit the best threshold to master state
+        valueRanges[f][k] = bestValue;
+        for (size_t i = 0; i < trainCount; i++) {
+          int newBit = (trainData[i][f] > bestValue) ? 1 : 0;
+          if (newBit != trainBinInputs[i].get(bitPos)) {
+            masterWisard.untrainSingle(trainBinInputs[i], trainLabels[i]);
+            trainBinInputs[i].set(bitPos, newBit);
+            masterWisard.trainSingle(trainBinInputs[i], trainLabels[i]);
+          }
+        }
+        for (size_t i = 0; i < valCount; i++) {
+          valBinInputs[i].set(bitPos, (valData[i][f] > bestValue) ? 1 : 0);
+        }
+        bestAcc = bestThresholdAcc;
+      }
+    }
+
+    return bestAcc;
+  }
+
+  BinInput transform(const std::vector<double>& data) {
+    if (!fitted) {
+      throw Exception("StochasticThermometer must be fitted before transform!");
+    }
+
+    BinInput out(data.size() * thermometerSize);
+    size_t k = 0;
+    for (size_t i = 0; i < data.size(); i++) {
+      for (size_t j = 0; j < valueRanges[i].size(); j++) {
+        if (data[i] > valueRanges[i][j]) {
+          out.set(k, 1);
+        } else {
+          out.set(k, 0);
+        }
+        k++;
+      }
+    }
+    return out;
+  }
+
+  size_t getSize() const {
+    return thermometerSize;
+  }
+
+  std::vector<std::vector<double>> getThresholds() const {
+    return valueRanges;
+  }
+
+  void setThresholds(const std::vector<std::vector<double>>& thresholds) {
+    valueRanges = thresholds;
+    fitted = true;
+  }
+
+private:
+  double classifyValidation(
+    const Wisard& wisard,
+    const std::vector<BinInput>& valBinInputs,
+    const std::vector<std::string>& valLabels
+  ) {
+    int correct = 0;
+    for (size_t i = 0; i < valBinInputs.size(); i++) {
+      if (wisard.classify(valBinInputs[i]) == valLabels[i]) correct++;
+    }
+    return (double)correct / (double)valBinInputs.size();
+  }
+
+  // Distribute work [startIdx, endIdx) across threads
+  template<typename Func>
+  void parallelFor(
+    int startIdx, int endIdx, int nThreads,
+    Func& func,
+    std::vector<Wisard>& wisards
+  ) {
+    int total = endIdx - startIdx;
+    if (total <= 0) return;
+
+    int actualThreads = std::min(nThreads, total);
+    if (actualThreads <= 1) {
+      func(0, startIdx, endIdx);
+      return;
+    }
+
+    std::vector<std::thread> threads;
+    threads.reserve(actualThreads);
+    int chunk = (total + actualThreads - 1) / actualThreads;
+
+    for (int t = 0; t < actualThreads; t++) {
+      int lo = startIdx + t * chunk;
+      int hi = std::min(lo + chunk, endIdx);
+      if (lo >= endIdx) break;
+      threads.emplace_back(func, t, lo, hi);
+    }
+
+    for (auto& t : threads) {
+      t.join();
+    }
+  }
+
+protected:
+  size_t thermometerSize;
+  std::vector<std::vector<double>> valueRanges;
+  bool fitted;
 };
 
 }

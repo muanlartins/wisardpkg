@@ -46,19 +46,27 @@ pip install --no-build-isolation .             # if pybind11 is already in the v
 
 ### generate_include.py
 
-Generates `include/wisardpkg.hpp` — a single-file C++ header that wraps all source files in a `wisardpkg` namespace. Useful for C++ projects that want to use the library without Python:
+Generates `include/wisardpkg.hpp` — a single-file C++ header that concatenates the source `.cc`/`.h` files into a `wisardpkg` namespace, for C++ projects that use the library without Python:
 
 ```cpp
 #include "wisardpkg.hpp"
 using namespace wisardpkg;
 ```
 
-The script:
-1. Reads 55 source files in dependency order
-2. Strips `#include` lines referencing internal files
-3. Wraps everything in `namespace wisardpkg { ... }`
-4. Adds header guards and version info
-5. Includes nlohmann/json inline
+The script reads a **hardcoded** list of source files (`generate_include.py:11`), strips nothing (each `.cc` already omits internal `#include`s), wraps the concatenation in `namespace wisardpkg { ... }` (`generate_include.py:81`), prepends `base.h` + `version.h` + the inline nlohmann/json lib, and adds a header guard (`generate_include.py:71`). The Makefile target is `make geninclude`.
+
+The C++-only path covers the **whole fork**. `generate_include.py:11` lists the source files (`.cc`/`.h`) in the same dependency order as `src/wisardpkg.h`, minus the Python `wrappers/*.cc` and the two `pybind11` includes (Python-only, correctly excluded). Run `make geninclude` to regenerate `include/wisardpkg.hpp`; the result compiles standalone (`g++ -std=c++11`) and exposes every fork symbol — `BloomWisard`, `Local2DMapping`, and all 13 binarizers.
+
+> **C++17 caveat:** the library targets C++11. `std::random_shuffle` (removed in C++17) is used at `src/synthetic_data/synthesizers.cc:47` and `src/models/regressionwisard/regressionwisard.cc:213`, so consuming the standalone header at `-std=c++17` requires first replacing those two calls (a behaviour-preserving `std::rand()`-based shuffle, or `std::shuffle` with a seeded generator). The `performance` branch POC is independent new C++17 code and is unaffected.
+
+#### Keeping the list in sync with `src/wisardpkg.h`
+
+`src/wisardpkg.h` is the authoritative include order (it is what `src/wisard_bind.cc` compiles). When a new `.cc` is added there, mirror it into `generate_include.py:11`. Two ordering rules that the list already honours:
+
+1. **`mapping/local2dmapping.cc` precedes `mapping/mappinggeneratorhelper.cc`.** The factory references `new Local2DMapping(params)` at `src/mapping/mappinggeneratorhelper.cc:23`, so the class must be declared first.
+2. **`binarization/stochasticthermometer.cc` is emitted last, after the model block.** `StochasticThermometer::optimize()` constructs a `Wisard` (`src/binarization/stochasticthermometer.cc:89`), matching `src/wisardpkg.h:85`.
+
+The bloomwisard headers (`murmur3.h`, `lsh.h`) are listed before the bloomwisard `.cc` files, also matching `src/wisardpkg.h:64-69`.
 
 ### Version Management
 
@@ -166,10 +174,10 @@ After running `make geninclude`:
 #include "include/wisardpkg.hpp"
 using namespace wisardpkg;
 
-// Use classes directly (no Python)
 Wisard w;
-// ...
 ```
+
+> ⚠️ The generated header is **fork-incomplete and currently uncompilable** — see [generate_include.py](#generate_includepy) above. `BloomWisard`, `Local2DMapping`, and four thermometers are absent, and the partial source list references `Local2DMapping` without defining it. Fix `generate_include.py`'s list against `src/wisardpkg.h:12-85` before relying on the C++-only path. The Python build (`pip install .`) compiles `src/wisard_bind.cc` → `src/wisardpkg.h` directly and is unaffected.
 
 ### Continuous Integration
 

@@ -126,9 +126,15 @@ Two methods for assigning input bits to RAMs:
 
 ### Classification
 
-`classify(BinInput, totalTrained=0)` returns a vector of votes, one per RAM:
-- Each RAM computes its vote via `getVote(input)`
-- If `balanced=true`: each vote is scaled by `count / totalTrained` to normalize classes with different training set sizes
+`classify(const BinInput&, float totalTrainned=0)` returns a **`std::vector<int>`**, one entry per RAM, indexed by RAM position (`votes[i] = rams[i].getVote(image)`). It does **not** return a label, and it is not keyed by anything — it is a dense positional vector of length `getNumberOfRAMS()`.
+
+**Source:** `src/models/wisard/discriminator.cc:50` (`std::vector<int> classify(const BinInput& image, float totalTrainned=0) const`).
+
+- Each RAM computes its vote via `rams[i].getVote(image)` (discriminator.cc:55–60).
+- When `totalTrainned != 0`, a relevance factor `relevance = count / totalTrainned` is computed once (discriminator.cc:53) and every vote is scaled by it (`votes[i] = rams[i].getVote(image) * relevance`, discriminator.cc:59). When `totalTrainned == 0` (the default) votes are returned raw. There is no `balanced` parameter; the only knob is whether `totalTrainned` is passed non-zero.
+- `votes[i]` is `int`, so the relevance scaling is truncated to integer per RAM.
+
+Through PyBind11, `std::vector<int>` is converted to a Python **`list`**, not a `dict`. The binding is `.def("classify", &DiscriminatorWrapper::classify)` at `src/wisard_bind.cc:266`; `DiscriminatorWrapper` inherits `classify` unchanged from `Discriminator` (`src/wrappers/discriminatorwrapper.cc:2`), so the C++ signature is the one exposed verbatim.
 
 ### Training
 
@@ -189,8 +195,11 @@ disc = wp.Discriminator(
 )
 disc.train(wp.BinInput([1,0,1,0,1,0,1,0,1]))
 votes = disc.classify(wp.BinInput([1,0,1,0,1,0,1,0,1]))
-# votes is a dict: {ram_index: vote_count}
+# votes is a list[int] of length disc.getNumberOfRAMS();
+# votes[i] is the vote of RAM i. NOT a dict.
 ```
+
+> **Correction (earlier docs).** Prior revisions described `classify` as returning a dict `{ram_index: vote_count}`. It returns a positional `list[int]` (`std::vector<int>`, `discriminator.cc:50`). A user iterating `votes.items()` or indexing by a non-contiguous RAM id will get an `AttributeError` / wrong result. Use plain integer indexing (`votes[i]`) or `enumerate(votes)`.
 
 ### Constructor Parameters
 
@@ -206,49 +215,10 @@ votes = disc.classify(wp.BinInput([1,0,1,0,1,0,1,0,1]))
 
 ---
 
-## RAMDataHandle
+## RAMDataHandle and RegressionRAMDataHandle
 
-**Source:** `src/models/wisard/ramdatahandle.cc`
-
-Handles serialization and persistence of classification RAM data.
-
-### Storage Format
-
-Base64-encoded binary blocks where each entry is `(addr_t address, content_t value)`. Multiple RAMs are separated by `"."` in the serialized string.
-
-### Python API
-
-```python
-# Create from discriminator data
-handle = wp.RAMDataHandle(discriminator_data_string)
-
-# Access RAM data
-ram_data = handle.get(ram_index)          # full RAM dict
-value = handle.get(ram_index, address)    # single value
-
-# Modify
-handle.set(ram_index, address, new_value)
-
-# Serialize
-data_string = handle.data()              # all RAMs
-ram_string = handle.data(ram_index)       # single RAM
-```
-
----
-
-## RegressionRAMDataHandle
-
-**Source:** `src/models/regressionwisard/regressionramdatahandle.cc`
-
-Same concept as RAMDataHandle but for regression RAMs. Each entry stores `(address, [count, sum_y, fit])` as 4 doubles (32 bytes per entry).
-
-### Python API
-
-```python
-handle = wp.RegressionRAMDataHandle(data_string)
-# or from raw dict: wp.RegressionRAMDataHandle({addr: [count, sum_y, fit], ...})
-
-ram_dict = handle.get(ram_index)
-handle.set(ram_index, {addr: [count, sum_y, fit], ...})
-serialized = handle.data()
-```
+External access to serialized RAM data (inspect / modify / compare discriminator
+memory). Full Python API, storage format, and `file:line` live in
+[data-structures.md](data-structures.md#ramdatahandle) — not duplicated here.
+**Source:** `src/models/wisard/ramdatahandle.cc`,
+`src/models/regressionwisard/regressionramdatahandle.cc`.

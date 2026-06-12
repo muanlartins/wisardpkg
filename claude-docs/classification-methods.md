@@ -2,7 +2,9 @@
 
 Classification methods are pluggable strategies (Strategy pattern) that decide the final class label from the raw vote vectors produced by discriminators. All inherit from `ClassificationBase`.
 
-**Source files:** `src/classification_methods/classificationbase.cc`, `bleaching.cc`, `bestbleaching.cc`, `bbleaching.cc`, `weighted.cc`, `register.cc`
+**Compiled methods:** `Bleaching`, `BestBleaching`, `Weighted` (all three bound to Python and registered for JSON). `BBleaching` ships as source but is orphaned — never compiled, bound, or registered (see its section below).
+
+**Source files:** `src/classification_methods/classificationbase.cc`, `bleaching.cc`, `bestbleaching.cc`, `weighted.cc`, `register.cc`. The orphaned `bbleaching.cc` is **not** `#include`'d by `src/wisardpkg.h`.
 
 ## Base Class: ClassificationBase
 
@@ -90,29 +92,36 @@ wisard = wp.Wisard(addressSize=3, classificationMethod=wp.BestBleaching())
 
 ---
 
-## BBleaching (Binary Bleaching)
+## BBleaching (Binary Bleaching) — NOT available
 
-Uses binary search instead of linear iteration to find the optimal threshold.
+> **`BBleaching` cannot be used from Python or C++ in this build.** The source file exists but is never compiled, never bound to Python, and never registered for deserialization. Do not pass `wp.BBleaching(...)` as a `classificationMethod` — the symbol does not exist on the `wisardpkg` module. Use `BestBleaching` instead (it performs the full threshold scan that BBleaching was meant to accelerate).
 
-**Source:** `src/classification_methods/bbleaching.cc`
+**Source:** `src/classification_methods/bbleaching.cc` (orphaned — see below).
 
-### Algorithm
+### Intended algorithm
 
-1. Find the maximum vote value across all classes/RAMs
-2. Start with threshold = `maxVote / 2`
-3. Binary search: if ambiguous, increase threshold; if unambiguous, decrease
-4. Step size halves each iteration (power-of-2 increments)
-5. Stop when step size reaches 0
+The file describes a binary search over the bleaching threshold:
 
-### Advantage
+1. Find the maximum vote value across all classes/RAMs (`getBiggestValue`, bbleaching.cc:49)
+2. Start with threshold = `biggest / 2` (bbleaching.cc:14–15)
+3. If ambiguous, raise the threshold by the current step; otherwise lower it (bbleaching.cc:33–38)
+4. Step size halves each iteration (`piece = biggest / 2^steps`, bbleaching.cc:30)
+5. Stop when `piece == 0` (bbleaching.cc:31)
 
-Faster convergence for large vote ranges — O(log N) iterations instead of O(N).
+This would give O(log N) iterations instead of `BestBleaching`'s O(N) linear scan.
 
-### Parameters
+### Why it does not work
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `bleachingActivated` | `bool` | true | Enable binary search bleaching |
+It is wired into nothing and would not even compile against the current `ClassificationBase` interface:
+
+| Gap | Evidence |
+|-----|----------|
+| Not included in the compilation unit | `src/wisardpkg.h:17–23` includes `classificationbase`, `bleaching`, `bestbleaching`, `weighted`, `register` — **not** `bbleaching.cc`. The whole library is one translation unit (`.cc` files are `#include`'d), so an un-included file is dead. |
+| Not bound to Python | `src/wisard_bind.cc:298–309` binds only `Bleaching`, `BestBleaching`, and `Weighted`. There is no `py::class_<BBleaching, ...>`. |
+| Not in the JSON registry | `src/classification_methods/register.cc:16–25` dispatches only `"Bleaching"`, `"BestBleaching"`, `"Weighted"`; any other `className` (including `"BBleaching"`) falls through to `new Bleaching()` (register.cc:25). A serialized BBleaching would silently load back as plain Bleaching. |
+| Signature incompatible with the base class | `ClassificationBase` (classificationbase.cc:2–7) requires `run` to return `std::map<std::string,int>` **by value**, plus pure-virtual `clone() const`, `className() const`, `json() const`. `BBleaching` returns `std::map<std::string,int>&` (a reference to a heap-leaked map, bbleaching.cc:8–41), implements **neither** `clone` nor `className`, and its `json()` (bbleaching.cc:44) has no `const` and no return statement. It also calls `isThereAmbiguity(*labels)` with one argument (bbleaching.cc:28) while the base declares it with two (classificationbase.cc:32). As written it is an abstract class and could not be instantiated even if it were included. |
+
+To get binary-search-style threshold tuning today, use the Python `BTHOWeN` port (`wisardpkg/models/bthowen.py`), which does its own binary-search bleach tuning on top of `BloomWisard` — see [Python Models](python-models.md).
 
 ---
 
@@ -161,15 +170,17 @@ wisard.classificationMethod.setWeights(new_weights)
 }
 ```
 
-`ClassificationMethods::load(config)` dispatches on `className` to instantiate the right subclass. Supported: `"Bleaching"`, `"BestBleaching"`, `"Weighted"`. Unknown types default to `Bleaching()`.
+`ClassificationMethods::load(config)` dispatches on `className` to instantiate the right subclass (register.cc:16–25). Supported: `"Bleaching"`, `"BestBleaching"`, `"Weighted"`. Any other type — including `"BBleaching"` — falls through to `new Bleaching()` (register.cc:25), so it loads back as plain Bleaching, not as the named method.
 
 ---
 
 ## Comparison
 
-| Method | Strategy | Speed | Best For |
-|--------|----------|-------|----------|
-| Bleaching | Linear threshold scan, stops at first clear winner | Fast (usually few iterations) | General use, default |
-| BestBleaching | Full threshold scan, picks best confidence | Slower (scans all levels) | When early stopping picks poorly |
-| BBleaching | Binary search for threshold | Fast (log N iterations) | Large vote ranges |
-| Weighted | Weighted votes + bleaching | Same as Bleaching | Domain knowledge about feature importance |
+Only the first three rows are usable. `BBleaching` is listed for completeness — it is not available in this build (see its section above).
+
+| Method | Available | Strategy | Speed | Best For |
+|--------|-----------|----------|-------|----------|
+| Bleaching | yes | Linear threshold scan, stops at first clear winner | Fast (usually few iterations) | General use, default |
+| BestBleaching | yes | Full threshold scan, picks best confidence | Slower (scans all levels) | When early stopping picks poorly |
+| Weighted | yes | Weighted votes + bleaching | Same as Bleaching | Domain knowledge about feature importance |
+| BBleaching | **no** | Binary search for threshold (intended) | — | — (orphaned source; use BestBleaching or the BTHOWeN port) |

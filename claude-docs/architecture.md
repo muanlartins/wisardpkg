@@ -42,19 +42,23 @@ ClassificationBase (strategy pattern)
 └── Weighted
 
 MappingGenerator (abstract)
-└── RandomMapping (uniform OR multi-resolution tuple sizes)
+├── RandomMapping (uniform OR multi-resolution tuple sizes)
+└── Local2DMapping (tiled 2D windows for image-shaped inputs)
 
-BinBase (abstract binarization)
+BinBase (abstract binarization — 13 Python-bound subclasses, src/wisard_bind.cc:90–179)
 ├── Thresholding
 ├── MeanThresholding
 ├── SimpleThermometer
 ├── DynamicThermometer
+├── CircularThermometer           (static, periodic values; ctor (size, min, max))
 ├── DistributiveThermometer      (fit-based, per-feature percentile thresholds)
 ├── GaussianThermometer          (fit-based, per-feature Gaussian CDF thresholds)
 ├── ExponentialThermometer       (fit-based, per-feature Exponential CDF thresholds)
+├── LogarithmicThermometer       (fit-based, per-feature log-spaced thresholds)
 ├── StochasticThermometer        (fit+optimize, coordinate descent on thresholds)
 ├── SupervisedThermometer        (fit-based, label-aware: class_conditional /
 │                                  mi_allocation / entropy_weighted)
+├── ColorMaskBinarization        (static, palette predicates — 3 bits/pixel)
 └── KernelCanvas → KernelCanvasWrapper (Python-exposed)
 
 Mean (abstract regression aggregation)
@@ -102,9 +106,9 @@ All source is in `src/` as `.cc` files included from the master header `wisardpk
 | Directory | Purpose |
 |-----------|---------|
 | `src/common/` | Type definitions (`definetypes.cc`), utilities (`utils.cc`), exceptions (`exceptions.cc`) |
-| `src/binarization/` | Binary encoding techniques (`binbase.cc`, `thresholding.cc`, `meanthresholding.cc`, `thermometer.cc`, `distributivethermometer.cc`, `gaussianthermometer.cc`, `exponentialthermometer.cc`, `stochasticthermometer.cc`, `supervisedthermometer.cc`, `kernelcanvas.cc`) |
-| `src/classification_methods/` | Vote aggregation strategies (`bleaching.cc`, `bestbleaching.cc`, `bbleaching.cc`, `weighted.cc`, `register.cc`) |
-| `src/mapping/` | Input-to-RAM bit assignment (`mappinggenerator.cc`, `randommapping.cc`, `mappinggeneratorhelper.cc`) |
+| `src/binarization/` | Binary encoding techniques (`binbase.cc`, `thresholding.cc`, `meanthresholding.cc`, `thermometer.cc`, `distributivethermometer.cc`, `gaussianthermometer.cc`, `exponentialthermometer.cc`, `logarithmicthermometer.cc`, `circularthermometer.cc`, `stochasticthermometer.cc`, `supervisedthermometer.cc`, `colormaskbinarization.cc`, `kernelcanvas.cc`) |
+| `src/classification_methods/` | Vote aggregation strategies (`bleaching.cc`, `bestbleaching.cc`, `bbleaching.cc`, `weighted.cc`, `register.cc`). `bbleaching.cc` is C++-internal only — not bound in `register.cc` or `wisard_bind.cc`, so unreachable from Python. |
+| `src/mapping/` | Input-to-RAM bit assignment (`mappinggenerator.cc`, `randommapping.cc`, `local2dmapping.cc`, `mappinggeneratorhelper.cc`) |
 | `src/data/` | Data containers (`bininput.cc`, `dataset.cc`) |
 | `src/synthetic_data/` | Data generation (`synthesizers.cc`) |
 | `src/models/base/` | Abstract model interfaces (`model.cc`, `classificationmodel.cc`, `regressionmodel.cc`) |
@@ -132,7 +136,7 @@ Each Python-exposed model has a `*Wrapper` class that:
 ### Strategy Pattern
 - **Classification methods**: Pluggable via `ClassificationBase*` — swap Bleaching for BestBleaching without changing the model
 - **Mean functions**: Pluggable via `Mean*` — swap SimpleMean for PowerMean in regression models
-- **Mapping generators**: Pluggable via `MappingGenerator*` — currently only RandomMapping implemented
+- **Mapping generators**: Pluggable via `MappingGenerator*` — `RandomMapping` (default) and `Local2DMapping` (image windows)
 
 ### Factory/Registry
 `ClassificationMethods::load()` and `MappingGeneratorHelper::load()` deserialize from JSON by dispatching on a `className` field.
@@ -160,6 +164,10 @@ regression_ram_t     = unordered_map<addr_t, regression_content_t>  // Regressio
 ## Serialization
 
 Models serialize to JSON via `json()` methods. RAMDataHandle and RegressionRAMDataHandle use Base64-encoded binary blocks for efficient RAM storage. DataSet has its own text-based format with prefixes: `R` (regression), `C` (classification), `U` (unsupervised).
+
+## Memory Accounting: `getsizeof` vs `deployedSizeBytes`
+
+Every `Model` exposes two byte-size queries with different meaning. `getsizeof()` is the **in-process** footprint (full C++ structs, hash-map buckets, label strings, weight vectors). `deployedSizeBytes()` is the **minimal shippable** learned state on one yardstick comparable across model families: lossless bit-packed seen-address set for `Wisard`/`ClusWisard`, the fixed `numRAMs × numBits` bit-table for `BloomWisard`. It is `virtual` on `Model` with the default `return getsizeof()` (`src/models/base/model.cc:10`); regression models keep that default, the WiSARD families override it. This is the distinction the F4RM paper's memory comparison relies on. Full reference (per-model formulas, the lifecycle/inspection methods `trainSingle`/`untrainSingle`/`reset`/`getTupleSizes`, and the `BloomWisard` inspectors): `classification-models.md` → "Model lifecycle and inspection".
 
 ## Key Source Files
 

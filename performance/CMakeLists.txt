@@ -9,7 +9,13 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 
-set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=native")
+# Optimization flags are overridable so the benchmark can build a plain `-O2`
+# rung of the ladder alongside the default `-O3 -march=native`:
+#   cmake -S . -B build-o2 -DWP_OPT_FLAGS=-O2
+if(NOT WP_OPT_FLAGS)
+  set(WP_OPT_FLAGS "-O3 -march=native")
+endif()
+set(CMAKE_CXX_FLAGS_RELEASE "${WP_OPT_FLAGS}")
 
 add_executable(wisard_bench
   src/wisard.cpp

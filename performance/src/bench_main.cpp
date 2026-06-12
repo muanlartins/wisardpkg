@@ -10,6 +10,7 @@
 #include <cstring>
 #include <fstream>
 #include <random>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -58,11 +59,18 @@ int activeThreads(int requested) {
 #endif
 }
 
-double median(std::vector<double>& v) {
+double median(std::vector<double> v) {
   if (v.empty()) return 0.0;
   std::sort(v.begin(), v.end());
   size_t m = v.size() / 2;
   return (v.size() & 1) ? v[m] : 0.5 * (v[m - 1] + v[m]);
+}
+
+double percentile(std::vector<double>& sorted, double q) {
+  if (sorted.empty()) return 0.0;
+  size_t idx = size_t(q * (sorted.size() - 1) + 0.5);
+  if (idx >= sorted.size()) idx = sorted.size() - 1;
+  return sorted[idx];
 }
 
 uint32_t computeNumRAMs(uint32_t entrySize, uint32_t addressSize) {
@@ -91,6 +99,38 @@ double scoreAccuracy(const std::vector<uint32_t>& pred,
   return double(correct) / double(pred.size());
 }
 
+struct LatencyDist {
+  double p50 = 0, p99 = 0, mean = 0, max = 0;
+};
+
+// Single-threaded per-sample latency. Timing each classify individually adds a
+// steady_clock pair per sample, so these percentiles are an upper bound on the
+// true per-sample cost (clock overhead is included, identically for every
+// contender that measures the same way). Throughput is reported separately from
+// the un-instrumented bulk pass.
+LatencyDist measureLatency(const wp::Wisard& w, const wp::WbinData& d) {
+  std::vector<wp::content_t> buf(size_t(w.numClasses()) * w.numRAMs());
+  std::vector<double> lat;
+  lat.reserve(d.testBits.n);
+  volatile uint32_t sink = 0;
+  for (size_t s = 0; s < d.testBits.n; ++s) {
+    auto a = Clock::now();
+    sink ^= w.predictOne(d.testBits, s, buf.data());
+    auto b = Clock::now();
+    lat.push_back(msSince(a, b));
+  }
+  (void)sink;
+  std::sort(lat.begin(), lat.end());
+  LatencyDist L;
+  L.p50 = percentile(lat, 0.50);
+  L.p99 = percentile(lat, 0.99);
+  L.max = lat.empty() ? 0.0 : lat.back();
+  double sum = 0;
+  for (double x : lat) sum += x;
+  L.mean = lat.empty() ? 0.0 : sum / lat.size();
+  return L;
+}
+
 struct RunMetrics {
   double train_ms = 0;
   double infer_ms_total = 0;
@@ -113,33 +153,54 @@ RunMetrics runOnce(wp::Wisard& w, const wp::WbinData& d,
   return m;
 }
 
-void emitJson(const std::string& path, const RunMetrics& m, size_t nTest,
-              uint32_t addressSize, uint32_t numRAMs, int reps, int threads,
-              long rss) {
+std::string arrJson(const std::vector<double>& v) {
+  std::ostringstream s;
+  s << "[";
+  for (size_t i = 0; i < v.size(); ++i) {
+    char b[64];
+    std::snprintf(b, sizeof(b), "%.6f", v[i]);
+    s << b;
+    if (i + 1 < v.size()) s << ", ";
+  }
+  s << "]";
+  return s.str();
+}
+
+void emitJson(const std::string& path, const RunMetrics& m,
+              const std::vector<double>& trainReps,
+              const std::vector<double>& inferReps, const LatencyDist& lat,
+              size_t nTest, uint32_t addressSize, uint32_t numRAMs, int reps,
+              int threads, long rss) {
   double per = nTest ? m.infer_ms_total / double(nTest) : 0.0;
-  double sps = m.infer_ms_total > 0 ? double(nTest) / (m.infer_ms_total / 1000.0) : 0.0;
-  char buf[1024];
-  std::snprintf(buf, sizeof(buf),
-                "{\n"
-                "  \"train_ms\": %.6f,\n"
-                "  \"infer_ms_total\": %.6f,\n"
-                "  \"infer_ms_per_sample\": %.6f,\n"
-                "  \"throughput_sps\": %.3f,\n"
-                "  \"peak_rss_bytes\": %ld,\n"
-                "  \"model_bytes\": %ld,\n"
-                "  \"accuracy\": %.6f,\n"
-                "  \"address_size\": %u,\n"
-                "  \"num_rams\": %u,\n"
-                "  \"reps\": %d,\n"
-                "  \"threads\": %d\n"
-                "}\n",
-                m.train_ms, m.infer_ms_total, per, sps, rss, m.model_bytes,
-                m.accuracy, addressSize, numRAMs, reps, threads);
+  double sps =
+      m.infer_ms_total > 0 ? double(nTest) / (m.infer_ms_total / 1000.0) : 0.0;
+  std::ostringstream s;
+  s.setf(std::ios::fixed);
+  s.precision(6);
+  s << "{\n"
+    << "  \"train_ms\": " << m.train_ms << ",\n"
+    << "  \"train_ms_reps\": " << arrJson(trainReps) << ",\n"
+    << "  \"infer_ms_total\": " << m.infer_ms_total << ",\n"
+    << "  \"infer_ms_reps\": " << arrJson(inferReps) << ",\n"
+    << "  \"infer_ms_per_sample\": " << per << ",\n"
+    << "  \"throughput_sps\": " << sps << ",\n"
+    << "  \"latency_ms_p50\": " << lat.p50 << ",\n"
+    << "  \"latency_ms_p99\": " << lat.p99 << ",\n"
+    << "  \"latency_ms_mean\": " << lat.mean << ",\n"
+    << "  \"latency_ms_max\": " << lat.max << ",\n"
+    << "  \"peak_rss_bytes\": " << rss << ",\n"
+    << "  \"model_bytes\": " << m.model_bytes << ",\n"
+    << "  \"accuracy\": " << m.accuracy << ",\n"
+    << "  \"address_size\": " << addressSize << ",\n"
+    << "  \"num_rams\": " << numRAMs << ",\n"
+    << "  \"reps\": " << reps << ",\n"
+    << "  \"threads\": " << threads << "\n"
+    << "}\n";
   if (path.empty()) {
-    std::fputs(buf, stdout);
+    std::fputs(s.str().c_str(), stdout);
   } else {
     std::ofstream f(path);
-    f << buf;
+    f << s.str();
   }
 }
 
@@ -194,9 +255,11 @@ int selftest(int threads) {
 
   std::vector<uint32_t> pred;
   RunMetrics m = runOnce(w, d, pred);
+  LatencyDist lat = measureLatency(w, d);
 
   int th = activeThreads(threads);
-  emitJson("", m, nTest, addressSize, d.numRAMs, 1, th, peakRssBytes());
+  emitJson("", m, {m.train_ms}, {m.infer_ms_total}, lat, nTest, addressSize,
+           d.numRAMs, 1, th, peakRssBytes());
 
   bool pass = m.accuracy > 0.90;
   std::printf("%s accuracy=%.4f (threshold 0.90)\n", pass ? "PASS" : "FAIL",
@@ -218,23 +281,30 @@ int runBench(const std::string& input, int threads, int reps,
   std::vector<double> trainTimes, inferTimes;
   RunMetrics last;
   std::vector<uint32_t> pred;
+  wp::Wisard w;
   for (int r = 0; r < reps; ++r) {
-    wp::Wisard w;
+    w = wp::Wisard();
     w.build(d.numClasses, d.numRAMs, d.addressSize, d.mapping);
     last = runOnce(w, d, pred);
     trainTimes.push_back(last.train_ms);
     inferTimes.push_back(last.infer_ms_total);
   }
 
+  LatencyDist lat = measureLatency(w, d);
+
   RunMetrics agg = last;
   agg.train_ms = median(trainTimes);
   agg.infer_ms_total = median(inferTimes);
 
   int th = activeThreads(threads);
-  emitJson(out, agg, d.nTest, d.addressSize, d.numRAMs, reps, th, peakRssBytes());
+  emitJson(out, agg, trainTimes, inferTimes, lat, d.nTest, d.addressSize,
+           d.numRAMs, reps, th, peakRssBytes());
   if (!out.empty()) {
-    std::printf("accuracy=%.4f model_bytes=%ld train_ms=%.3f infer_ms=%.3f\n",
-                agg.accuracy, agg.model_bytes, agg.train_ms, agg.infer_ms_total);
+    std::printf(
+        "accuracy=%.4f model_bytes=%ld train_ms=%.3f infer_ms=%.3f "
+        "p99_ms=%.4f\n",
+        agg.accuracy, agg.model_bytes, agg.train_ms, agg.infer_ms_total,
+        lat.p99);
   }
   return 0;
 }

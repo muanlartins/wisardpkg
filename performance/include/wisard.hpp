@@ -168,6 +168,11 @@ public:
   uint32_t numRAMs() const { return numRAMs_; }
   uint32_t addressSize() const { return addressSize_; }
 
+  inline uint32_t predictOne(const PackedInputs& in, size_t s,
+                             content_t* voteBuf) const {
+    return classifyOne(in, s, voteBuf);
+  }
+
 private:
   uint32_t classifyOne(const PackedInputs& in, size_t s,
                        content_t* voteBuf) const;
